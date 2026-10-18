@@ -68,6 +68,7 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use config::Config;
 use deep_backfill::{GalexieSource, HistoricalSource};
 use rpc_client::RpcClient;
+use reenrich::ReenrichOptions;
 
 /// Postgres advisory lock id used to elect a single active indexer.
 const INDEXER_LOCK_ID: i64 = 0x6c756d656e717261; // "lumenqra" as i64
@@ -221,6 +222,20 @@ fn parse_backfill_ledger(arg: Option<&str>) -> anyhow::Result<Option<u32>> {
     }
 }
 
+fn parse_reenrich_options(args: &[String]) -> anyhow::Result<ReenrichOptions> {
+    let mut options = ReenrichOptions::default();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--force" => options.force = true,
+            "--contract" => options.contract = Some(iter.next().context("--contract requires a value")?.clone()),
+            value if value.starts_with("--contract=") => options.contract = Some(value["--contract=".len()..].to_string()),
+            other => anyhow::bail!("unknown reenrich option: {other}"),
+        }
+    }
+    Ok(options)
+}
+
 /// A leader lock held on a dedicated Postgres connection that is never
 /// returned to the pool. Advisory locks are session-scoped, so the lock lives
 /// exactly as long as this connection. If the connection drops (idle timeout,
@@ -234,33 +249,24 @@ impl LeaderLock {
     /// Acquire the leader lock on a dedicated connection. If another instance
     /// holds it, block until it is released (hot standby).
     async fn acquire(pool: &sqlx::PgPool) -> anyhow::Result<Self> {
-        // Detach a connection from the pool so it is never handed back while
-        // we hold the session-scoped advisory lock.
         let mut conn = pool
             .acquire()
             .await
-            .context("failed to acquire dedicated connection for leader lock")?
-            .detach();
-
+            .context("failed to acquire advisory lock (blocking)")?;
         info!("acquiring indexer leader lock (id {})", INDEXER_LOCK_ID);
         let acquired = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
             .bind(INDEXER_LOCK_ID)
             .fetch_one(&mut conn)
             .await
             .context("failed to acquire advisory lock")?;
-
         if !acquired {
-            info!(
-                "another indexer instance holds the leader lock; \
-                 blocking until it releases (this instance will become a hot standby)"
-            );
+            info!("another indexer instance holds the leader lock; blocking until it releases");
             sqlx::query("SELECT pg_advisory_lock($1)")
                 .bind(INDEXER_LOCK_ID)
                 .execute(&mut conn)
                 .await
                 .context("failed to acquire advisory lock (blocking)")?;
         }
-
         info!("indexer leader lock acquired; this instance is now active");
         Ok(Self {
             conn: Arc::new(tokio::sync::Mutex::new(conn)),
@@ -487,10 +493,10 @@ fn env_parse_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/// Fetch a contract's deployed WASM and print its parsed interface as JSON.
-async fn inspect(rpc: &RpcClient, contract_id: &str) -> anyhow::Result<()> {
-    if !lumenqraph_core::is_valid_contract_id(contract_id) {
-        anyhow::bail!("invalid contract id {contract_id:?}: expected a C… strkey");
+    if args.get(1).map(String::as_str) == Some("reenrich") {
+        info!("running in reenrich mode");
+        let options = parse_reenrich_options(&args[2..])?;
+        return reenrich::run_reenrich(pool, rpc, config, options).await;
     }
     let Some((wasm_hash, wasm)) = rpc.get_contract_wasm(contract_id).await? else {
         anyhow::bail!(
