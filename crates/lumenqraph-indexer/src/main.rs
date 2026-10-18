@@ -24,10 +24,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use sqlx::postgres::{PgConnection, PgPoolOptions};
-use tokio::sync::Mutex;
 use tracing::info;
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use config::Config;
 use deep_backfill::{GalexieSource, HistoricalSource};
@@ -91,8 +88,86 @@ impl LeaderLock {
         let mut conn = pool
             .acquire()
             .await
-            .context("failed to acquire advisory-lock connection")?
-            .detach();
+            .context("failed to acquire advisory lock (blocking)")?;
+    }
+
+    info!("indexer leader lock acquired; this instance is now active");
+
+    sqlx::migrate!("../../migrations")
+        .run(&pool)
+        .await
+        .context("failed to run migrations")?;
+
+    if args.get(1).map(String::as_str) == Some("reenrich") {
+        info!("running in reenrich mode");
+        let result = reenrich::run_reenrich(pool.clone(), rpc, config).await;
+
+        // Release the advisory lock on exit.
+        info!("releasing indexer leader lock");
+        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(INDEXER_LOCK_ID)
+            .execute(&pool)
+            .await;
+
+        return result;
+    }
+
+    if args.get(1).map(String::as_str) == Some("backfill") {
+        let from = args
+            .get(2)
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(config.start_ledger);
+        info!(from, "running in backfill mode");
+        let result = backfill::run(pool.clone(), rpc, config, from).await;
+
+        // Release the advisory lock on exit.
+        info!("releasing indexer leader lock");
+        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(INDEXER_LOCK_ID)
+            .execute(&pool)
+            .await;
+
+        return result;
+    }
+
+    // deep-backfill: ingest beyond the RPC retention window from a data-lake
+    // source. Parse manual args: --from, --to, --source, --input (repeatable).
+    if args.get(1).map(String::as_str) == Some("deep-backfill") {
+        let result = run_deep_backfill(args, pool.clone(), config).await;
+        
+        // Release the advisory lock on exit.
+        info!("releasing indexer leader lock");
+        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(INDEXER_LOCK_ID)
+            .execute(&pool)
+            .await;
+        
+        return result;
+    }
+
+    if args.get(1).map(String::as_str) == Some("recover-gaps") {
+        info!("running in recover-gaps mode");
+        let specs = specs::SpecCache::new(config.spec_cache_max_entries, config.spec_fetch_concurrency);
+        let result = poller::recover_gaps(&pool, &rpc, &config, &specs).await;
+
+        // Release the advisory lock on exit.
+        info!("releasing indexer leader lock");
+        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(INDEXER_LOCK_ID)
+            .execute(&pool)
+            .await;
+
+        return result;
+    }
+
+    info!(
+        rpc_host = %rpc.active_endpoint_host(),
+        contracts = ?config.contract_ids,
+        poll_secs = config.poll_interval_secs,
+        "starting lumenqraph indexer (live)"
+    );
+
+        info!("acquiring indexer leader lock (id {})", INDEXER_LOCK_ID);
         let acquired = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
             .bind(INDEXER_LOCK_ID)
             .fetch_one(&mut conn)
@@ -198,29 +273,21 @@ async fn inspect(rpc: &RpcClient, contract_id: &str) -> anyhow::Result<()> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
-    tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .with(fmt::layer())
-        .init();
+
+    lumenqraph_core::telemetry::init_tracing();
 
     let cli = Cli::parse();
     let command = cli.command.unwrap_or(Command::Run);
     let config = Config::from_env().context("failed to load config")?;
-    let pool = PgPoolOptions::new()
-        .max_connections(config.database_max_connections)
-        .min_connections(config.database_min_connections)
-        .acquire_timeout(Duration::from_secs(env_parse_u64(
-            "DATABASE_ACQUIRE_TIMEOUT_SECS",
-            30,
-        )))
-        .idle_timeout(Duration::from_secs(env_parse_u64(
-            "DATABASE_IDLE_TIMEOUT_SECS",
-            600,
-        )))
-        .connect(&config.database_url)
-        .await
-        .context("failed to connect to Postgres")?;
+
+    let db = Config::db_config()?;
+    let pool = lumenqraph_core::db::connect_with_retry(&config.database_url, &db).await?;
+
+    // Build the RPC client with all configured endpoints (#398).
+    // RPC_URLS takes precedence over RPC_URL; both are parsed by Config::from_env.
     let rpc = RpcClient::with_urls(config.rpc_urls.clone(), config.rpc_timeout_secs);
+    let network_passphrase = rpc.validate_network_passphrases().await?;
+    info!(%network_passphrase, endpoints = config.rpc_urls.len(), "validated RPC network identity");
 
     match &command {
         Command::Migrate => return run_migrations(&pool).await,
@@ -259,4 +326,20 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Migrate | Command::Inspect { .. } => unreachable!(),
     }
+
+    info!(
+        rpc_host = %rpc.active_endpoint_host(),
+        rpc_endpoints = config.rpc_urls.len(),
+        contracts = ?config.contract_ids,
+        poll_secs = config.poll_interval_secs,
+        "starting lumenqraph indexer (live)"
+    );
+
+    let pool_arc = std::sync::Arc::new(pool.clone());
+    let specs_arc = std::sync::Arc::new(specs);
+    let bind_addr = std::env::var("INDEXER_HTTP_BIND_ADDR")
+        .unwrap_or_else(|_| "0.0.0.0:9090".to_string());
+    http::start_http_server(pool_arc, specs_arc.clone(), &bind_addr).await?;
+
+    poller::run(pool, rpc, config, specs_arc).await
 }

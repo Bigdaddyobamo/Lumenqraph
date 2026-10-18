@@ -7,70 +7,15 @@ mod dispatcher;
 mod metrics;
 
 use anyhow::Context;
-use sqlx::postgres::PgPoolOptions;
 use std::time::Duration;
 use tracing::info;
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
-use tokio_util::sync::CancellationToken;
 
 use config::Config;
-
-async fn connect_with_retry(config: &Config) -> anyhow::Result<sqlx::PgPool> {
-    let database_url = &config.database_url;
-    let max_retries = config.db_connect_retries;
-    let mut attempt = 0;
-    let mut retry_delay = Duration::from_secs(1);
-    let max_delay = Duration::from_secs(30);
-    loop {
-        match PgPoolOptions::new()
-            .max_connections(config.db_max_connections)
-            .min_connections(config.db_min_connections)
-            .acquire_timeout(Duration::from_secs(config.db_acquire_timeout_secs))
-            .idle_timeout(Duration::from_secs(config.db_idle_timeout_secs))
-            .connect(database_url)
-            .await
-        {
-            Ok(pool) => {
-                if attempt > 0 {
-                    info!(attempt, "successfully connected to Postgres after retries");
-                }
-                return Ok(pool);
-            }
-            Err(e) if attempt < max_retries => {
-                attempt += 1;
-                tracing::warn!(
-                    error = %e,
-                    attempt,
-                    max_retries,
-                    retry_delay_secs = retry_delay.as_secs(),
-                    "failed to connect to Postgres, retrying…"
-                );
-                tokio::time::sleep(retry_delay).await;
-                retry_delay = (retry_delay * 2).min(max_delay);
-            }
-            Err(e) => {
-                return Err(anyhow::anyhow!("failed to connect to Postgres after {max_retries} retries: {e}"));
-            }
-        }
-    }
-}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
-
-    // healthcheck: probe the metrics server's /health and exit 0/1 (#469).
-    if std::env::args().nth(1).as_deref() == Some("healthcheck") {
-        let bind = std::env::var("WEBHOOKS_METRICS_BIND_ADDR")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| "127.0.0.1:9091".to_string());
-        lumenqraph_core::healthcheck::run_and_exit(&bind, "/health");
-    }
-    tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .with(fmt::layer())
-        .init();
+    lumenqraph_core::telemetry::init_tracing();
 
     // Validate CONTRACT_IDS at startup so a misconfigured address is caught
     // immediately rather than silently ignored.
@@ -85,7 +30,8 @@ async fn main() -> anyhow::Result<()> {
     // a message naming the variable instead of silently using the default.
     let config = Config::from_env()?;
     info!(config = ?config, "effective configuration");
-    let pool = connect_with_retry(&config).await?;
+    let db = lumenqraph_core::db::DbConfig { max_connections: config.db_max_connections, min_connections: config.db_min_connections, acquire_timeout_secs: config.db_acquire_timeout_secs, idle_timeout_secs: config.db_idle_timeout_secs, connect_retries: config.db_connect_retries };
+    let pool = lumenqraph_core::db::connect_with_retry(&config.database_url, &db).await?;
 
     // Migrations are applied by `lumenqraph-indexer migrate`, not here. Refuse
     // to start against a schema older than this binary (#473).
