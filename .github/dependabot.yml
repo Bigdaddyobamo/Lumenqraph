@@ -38,8 +38,8 @@ updates:
           - "soroban-*"
     open-pull-requests-limit: 5
     labels:
-      - dependencies
-      - rust
+      - ci-cd
+      - infra
 
   # ── TypeScript SDK (npm) ────────────────────────────────────────────────────
   - package-ecosystem: npm
@@ -55,8 +55,7 @@ updates:
           - "*"
     open-pull-requests-limit: 5
     labels:
-      - dependencies
-      - typescript
+      - sdk
 
   # ── Explorer (npm) ──────────────────────────────────────────────────────────
   # Covers esbuild, eslint and @playwright/test, which the explorer CI job
@@ -91,8 +90,7 @@ updates:
           - "*"
     open-pull-requests-limit: 5
     labels:
-      - dependencies
-      - python
+      - sdk
 
   # ── Docker base images ──────────────────────────────────────────────────────
   # Keeps the digest pins in the Dockerfile up-to-date so reproducible builds
@@ -107,8 +105,7 @@ updates:
       timezone: UTC
     open-pull-requests-limit: 5
     labels:
-      - dependencies
-      - docker
+      - infra
 
   # ── GitHub Actions ──────────────────────────────────────────────────────────
   - package-ecosystem: github-actions
@@ -124,5 +121,4 @@ updates:
           - "*"
     open-pull-requests-limit: 5
     labels:
-      - dependencies
-      - github-actions
+      - ci-cd
