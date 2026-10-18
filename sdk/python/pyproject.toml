@@ -36,6 +36,8 @@ dev = [
     "mypy>=1.11",
     "build>=1.0",
     "twine>=4.0",
+    "mypy>=1.10",
+    "ruff>=0.4",
 ]
 # Regenerates lumenqraph/models.py from openapi.yaml (scripts/codegen.py).
 codegen = [
@@ -61,3 +63,15 @@ files = ["lumenqraph"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[tool.mypy]
+strict = true
+python_version = "3.8"
+files = ["lumenqraph"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py38"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
