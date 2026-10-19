@@ -46,6 +46,63 @@ use read_cost_limit::ReadCostLimitConfig;
 use state::{AppState, BuildInfo};
 
 
+fn version_string() -> String {
+    format!(
+        "lumenqraph-api {}\ncommit: {}\nbuilt: {}",
+        env!("CARGO_PKG_VERSION"),
+        option_env!("LUMENQRAPH_GIT_SHA").unwrap_or("unknown"),
+        option_env!("LUMENQRAPH_BUILD_TIME").unwrap_or("unknown"),
+    )
+}
+
+/// CORS for the configured allowlist. `CORS_ALLOWED_ORIGINS` was validated by
+/// `ApiConfig::from_env`, so an invalid entry cannot reach this point (#581).
+fn build_cors_layer(origins_str: &str) -> tower_http::cors::CorsLayer {
+    use tower_http::cors::CorsLayer;
+
+    if origins_str.trim() == "*" {
+        info!("CORS: allowing all origins (permissive mode)");
+        return CorsLayer::permissive();
+    }
+    let origins = config::parse_cors_origins(origins_str).expect("validated by ApiConfig::from_env");
+    if origins.is_empty() {
+        info!("CORS: no allowed origins configured; browsers will enforce same-origin policy");
+        return CorsLayer::new();
+    }
+    info!(origins = ?origins, "CORS: allowing configured origins");
+    let allowed: Vec<http::HeaderValue> = origins
+        .iter()
+        .map(|origin| http::HeaderValue::from_str(origin).expect("origin is a valid header value"))
+        .collect();
+
+    CorsLayer::new()
+        .allow_origin(allowed)
+        .allow_methods([
+            axum::http::Method::GET,
+            axum::http::Method::POST,
+            axum::http::Method::PATCH,
+            axum::http::Method::OPTIONS,
+            axum::http::Method::DELETE,
+        ])
+        .allow_headers([
+            axum::http::header::CONTENT_TYPE,
+            axum::http::header::AUTHORIZATION,
+            axum::http::header::IF_NONE_MATCH,
+            http::HeaderName::from_static("x-api-key"),
+            http::HeaderName::from_static("x-request-id"),
+        ])
+        .expose_headers([
+            http::HeaderName::from_static("x-request-id"),
+            http::HeaderName::from_static("retry-after"),
+            http::HeaderName::from_static("x-ratelimit-limit"),
+            http::HeaderName::from_static("x-ratelimit-remaining"),
+            http::HeaderName::from_static("etag"),
+            http::HeaderName::from_static("deprecation"),
+            http::HeaderName::from_static("link"),
+        ])
+        .max_age(Duration::from_secs(600))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -153,12 +210,21 @@ async fn main() -> anyhow::Result<()> {
         metrics_require_auth: config.metrics_require_auth,
         proxy_limiter: Arc::new(RateLimiter::new()),
         config: Arc::clone(&config),
-        key_cache: Arc::new(KeyCache::new(2000)),
+        key_cache: Arc::new(KeyCache::new(
+            config.api_key_cache_capacity,
+            std::time::Duration::from_secs(config.api_key_cache_ttl_secs),
+            std::time::Duration::from_secs(config.api_key_cache_neg_ttl_secs),
+        )),
         ip_config: auth::IpConfig::from_env(),
         audit_tx: None,
         audit_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         shutdown: tokio_util::sync::CancellationToken::new(),
     };
+
+    // Resolve the RPC network passphrase in the background so /health never
+    // waits on the RPC (#578).
+    let rpc = state.rpc.clone();
+    tokio::spawn(async move { rpc.warm_network_passphrase().await });
 
     let bind_addr = config.bind_addr.clone();
     let max_body_bytes = config.max_body_bytes;
