@@ -106,8 +106,6 @@ pub struct ApiConfig {
     /// `pgp_sym_encrypt` key for webhook secrets. `None` falls back to the
     /// legacy insecure test key (a warning is logged at startup).
     pub webhook_encryption_key: Option<String>,
-    /// Retention for delivered/failed webhook deliveries. `0` disables pruning.
-    pub webhook_delivery_retention_days: i64,
 
     /// Sibling instances mounted under a path prefix (`INSTANCE_MOUNTS`).
     pub mounts: Vec<(String, String)>,
@@ -183,10 +181,6 @@ impl ApiConfig {
             },
 
             webhook_encryption_key,
-            webhook_delivery_retention_days: env_parse(
-                "WEBHOOK_DELIVERY_RETENTION_DAYS",
-                crate::routes::webhooks::DEFAULT_WEBHOOK_DELIVERY_RETENTION_DAYS,
-            )?,
 
             mounts: crate::routes::proxy::parse_mounts(&env_string("INSTANCE_MOUNTS", "")),
             proxy: ProxyConfig {
@@ -259,7 +253,6 @@ impl ApiConfig {
                 introspection_enabled: false,
             },
             webhook_encryption_key: None,
-            webhook_delivery_retention_days: 14,
             mounts: Vec::new(),
             proxy: ProxyConfig::default(),
         }
@@ -305,10 +298,6 @@ impl fmt::Debug for ApiConfig {
             .field(
                 "webhook_encryption_key",
                 &self.webhook_encryption_key.as_ref().map(|_| "[REDACTED]"),
-            )
-            .field(
-                "webhook_delivery_retention_days",
-                &self.webhook_delivery_retention_days,
             )
             .field("mounts", &self.mounts)
             .field("proxy", &self.proxy)
