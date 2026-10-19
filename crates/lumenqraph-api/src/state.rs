@@ -78,6 +78,8 @@ pub struct AppState {
     pub event_fanout: Arc<crate::routes::stream::EventFanout>,
     /// Per-client-IP rate limiter for sibling-instance mounts (#442).
     pub proxy_limiter: Arc<RateLimiter>,
+    /// Rate limiter for webhook create and management routes.
+    pub webhook_limiter: Arc<RateLimiter>,
     /// Typed configuration, parsed once at startup (#441). Handlers and
     /// middleware read settings from here, never from the environment.
     pub config: Arc<ApiConfig>,

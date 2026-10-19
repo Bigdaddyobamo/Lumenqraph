@@ -3,7 +3,7 @@
 //! and only their SHA-256 hash is ever compared against the database.
 //! Anonymous requests are rate limited per client IP address.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering;
 
 use axum::extract::{ConnectInfo, Request, State};
@@ -56,7 +56,7 @@ fn extract_key(headers: &HeaderMap) -> Option<String> {
 #[derive(Clone, Debug)]
 pub struct IpConfig {
     /// Number of trusted reverse-proxy hops sitting in front of the API
-    /// (controlled by `TRUSTED_PROXY_HOPS`, default 1).
+    /// (controlled by `TRUSTED_PROXY_HOPS`, default 0).
     ///
     /// With `hops = 1`, the rightmost entry in `X-Forwarded-For` that was
     /// **not** added by the trusted proxy is the client IP. Proxies append on
@@ -71,24 +71,57 @@ pub struct IpConfig {
     pub platform_header: Option<String>,
 }
 
+/// Parse `TRUSTED_PROXY_HOPS`. Unset or unparseable values mean zero hops, so
+/// a directly exposed API never trusts a client-supplied `X-Forwarded-For`.
+fn parse_trusted_proxy_hops(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(0)
+}
+
 impl IpConfig {
     /// Read configuration from the environment. Called once at startup.
     pub fn from_env() -> Self {
-        let trusted_proxy_hops = std::env::var("TRUSTED_PROXY_HOPS")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(1);
+        let trusted_proxy_hops =
+            parse_trusted_proxy_hops(std::env::var("TRUSTED_PROXY_HOPS").ok().as_deref());
 
         let platform_header = std::env::var("CLIENT_IP_HEADER").ok().and_then(|v| {
             let v = v.trim().to_lowercase();
             if v.is_empty() { None } else { Some(v) }
         });
 
+        tracing::info!(
+            trusted_proxy_hops,
+            platform_header = platform_header.as_deref().unwrap_or("none"),
+            "client IP resolution configured"
+        );
+
         IpConfig {
             trusted_proxy_hops,
             platform_header,
         }
     }
+}
+
+/// Parse a client-supplied IP candidate into its canonical text form.
+///
+/// Accepts a bare IPv4 or IPv6 address, an IPv4 address with a port, or a
+/// bracketed IPv6 address with an optional port. Anything else, including
+/// over-long strings, returns `None`.
+fn parse_client_ip(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    let addr = if let Some(rest) = s.strip_prefix('[') {
+        let (inner, after) = rest.split_once(']')?;
+        if !after.is_empty() {
+            after.strip_prefix(':')?.parse::<u16>().ok()?;
+        }
+        inner.parse::<IpAddr>().ok()?
+    } else if let Ok(ip) = s.parse::<IpAddr>() {
+        ip
+    } else {
+        let (host, port) = s.rsplit_once(':')?;
+        port.parse::<u16>().ok()?;
+        host.parse::<IpAddr>().ok()?
+    };
+    Some(addr.to_string())
 }
 
 /// Extract the real client IP address from an incoming request (#428).
@@ -104,19 +137,22 @@ impl IpConfig {
 ///    Proxies *append* the peer address to XFF, so the rightmost entry is the
 ///    one the outermost trusted proxy actually saw. We skip `hops` entries from
 ///    the right (one per trusted proxy layer) to land on the real client IP.
-///    With `hops = 1` (default): `X-Forwarded-For: 1.2.3.4, 5.6.7.8` yields
+///    With `hops = 1`: `X-Forwarded-For: 1.2.3.4, 5.6.7.8` yields
 ///    `5.6.7.8` — the attacker's leftmost spoofed entries are ignored.
 ///    With `hops = 0`: XFF is not consulted.
 ///
 /// 3. **TCP peer address** — used when no proxy configuration is trusted.
+///
+/// A candidate from either header is used only if it parses as an IP address.
+/// Otherwise the next source is tried, so arbitrary strings never become
+/// rate-limit, concurrency or log keys.
 pub fn extract_client_ip(headers: &HeaderMap, socket_addr: Option<SocketAddr>, cfg: &IpConfig) -> String {
     // 1. Platform-specific single-value header (Fly, Cloudflare, nginx real_ip…).
     if let Some(ref header_name) = cfg.platform_header {
         if let Some(ip) = headers
             .get(header_name.as_str())
             .and_then(|v| v.to_str().ok())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
+            .and_then(parse_client_ip)
         {
             return ip;
         }
@@ -127,12 +163,11 @@ pub fn extract_client_ip(headers: &HeaderMap, socket_addr: Option<SocketAddr>, c
         if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
             let parts: Vec<&str> = xff.split(',').map(|s| s.trim()).collect();
             // `parts.len() - hops` gives the index of the real client entry.
-            // If there are fewer entries than hops (misconfigured / no proxy),
-            // fall back to the leftmost entry rather than panicking.
-            if !parts.is_empty() {
-                let idx = parts.len().saturating_sub(cfg.trusted_proxy_hops);
-                let ip = parts[idx].to_string();
-                if !ip.is_empty() {
+            // Fewer entries than trusted hops means the header did not pass
+            // through the proxies we expect, so its leftmost entry is entirely
+            // client-controlled. Ignore it and use the socket address instead.
+            if parts.len() >= cfg.trusted_proxy_hops {
+                if let Some(ip) = parse_client_ip(parts[parts.len() - cfg.trusted_proxy_hops]) {
                     return ip;
                 }
             }
@@ -288,7 +323,7 @@ pub async fn auth_and_rate_limit(
         }
     };
 
-    let rl_status = state.limiter.check(&identity, limit);
+    let rl_status = state.limiter.check(&identity, limit).await;
     if !rl_status.allowed {
         if is_authenticated {
             let hash_prefix = identity.split(':').nth(1).unwrap_or("unknown");
@@ -343,7 +378,7 @@ pub async fn rpc_auth_and_rate_limit(
         }
     };
 
-    let rl_status = state.rpc_limiter.check(&identity, limit);
+    let rl_status = state.rpc_limiter.check(&identity, limit).await;
     if !rl_status.allowed {
         if is_authenticated {
             let hash_prefix = identity.split(':').nth(1).unwrap_or("unknown");
@@ -395,7 +430,7 @@ pub async fn webhook_auth_and_rate_limit(
         }
     };
 
-    let rl_status = state.webhook_limiter.check(&identity, limit);
+    let rl_status = state.webhook_limiter.check(&identity, limit).await;
     if !rl_status.allowed {
         if is_authenticated {
             let hash_prefix = identity.split(':').nth(1).unwrap_or("unknown");
@@ -475,7 +510,7 @@ pub async fn webhook_manage_auth_and_rate_limit(
     };
 
     let identity = format!("key:{hash}");
-    let rl_status = state.limiter.check(&identity, limit);
+    let rl_status = state.limiter.check(&identity, limit).await;
     if !rl_status.allowed {
         let mut response = (StatusCode::TOO_MANY_REQUESTS, crate::error::rate_limit_error()).into_response();
         if let Some(retry_after) = rl_status.retry_after_secs {
@@ -658,6 +693,72 @@ mod tests {
     }
 
     #[test]
+    fn unset_trusted_proxy_hops_defaults_to_zero() {
+        assert_eq!(parse_trusted_proxy_hops(None), 0);
+        assert_eq!(parse_trusted_proxy_hops(Some("not-a-number")), 0);
+        assert_eq!(parse_trusted_proxy_hops(Some(" 2 ")), 2);
+    }
+
+    #[test]
+    fn default_config_ignores_spoofed_xff_when_exposed_directly() {
+        let cfg = IpConfig {
+            trusted_proxy_hops: parse_trusted_proxy_hops(None),
+            platform_header: None,
+        };
+        let peer: SocketAddr = "10.0.0.5:4321".parse().unwrap();
+        let h = make_headers("x-forwarded-for", "9.9.9.9");
+        assert_eq!(extract_client_ip(&h, Some(peer), &cfg), "10.0.0.5");
+    }
+
+    #[test]
+    fn fewer_xff_entries_than_hops_falls_back_to_socket() {
+        let peer: SocketAddr = "10.0.0.5:4321".parse().unwrap();
+        let h = make_headers("x-forwarded-for", "1.2.3.4");
+        assert_eq!(extract_client_ip(&h, Some(peer), &cfg(2)), "10.0.0.5");
+    }
+
+    #[test]
+    fn parse_client_ip_accepts_ip_forms_and_strips_port() {
+        assert_eq!(parse_client_ip("1.2.3.4"), Some("1.2.3.4".into()));
+        assert_eq!(parse_client_ip(" 1.2.3.4:5555 "), Some("1.2.3.4".into()));
+        assert_eq!(parse_client_ip("2001:db8::1"), Some("2001:db8::1".into()));
+        assert_eq!(parse_client_ip("[2001:db8::1]:443"), Some("2001:db8::1".into()));
+        assert_eq!(parse_client_ip("[2001:db8::1]"), Some("2001:db8::1".into()));
+    }
+
+    #[test]
+    fn parse_client_ip_rejects_non_ip_values() {
+        assert_eq!(parse_client_ip(""), None);
+        assert_eq!(parse_client_ip("unknown"), None);
+        assert_eq!(parse_client_ip("1.2.3.4:notaport"), None);
+        assert_eq!(parse_client_ip("1.2.3.4:99999"), None);
+        assert_eq!(parse_client_ip("[2001:db8::1]x"), None);
+        assert_eq!(parse_client_ip(&"x".repeat(4096)), None);
+    }
+
+    #[test]
+    fn invalid_xff_entry_falls_back_to_socket() {
+        let peer: SocketAddr = "10.0.0.5:4321".parse().unwrap();
+        let h = make_headers("x-forwarded-for", "1.2.3.4, not-an-ip");
+        assert_eq!(extract_client_ip(&h, Some(peer), &cfg(1)), "10.0.0.5");
+    }
+
+    #[test]
+    fn invalid_platform_header_falls_back_to_xff() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            HeaderName::from_bytes(b"fly-client-ip").unwrap(),
+            HeaderValue::from_str("x".repeat(256).as_str()).unwrap(),
+        );
+        h.insert(
+            HeaderName::from_bytes(b"x-forwarded-for").unwrap(),
+            HeaderValue::from_str("1.2.3.4, 5.6.7.8").unwrap(),
+        );
+        let ip = extract_client_ip(&h, None, &cfg_with_platform(1, "fly-client-ip"));
+        assert_eq!(ip, "5.6.7.8");
+    }
+
+    #[test]
     fn platform_header_takes_priority_over_xff() {
         let mut h = HeaderMap::new();
         h.insert(
@@ -765,12 +866,12 @@ pub(crate) mod integration_tests {
             event_fanout: Arc::new(crate::routes::stream::EventFanout::new()),
             require_auth,
             anon_rate_limit: anon_rate,
-            limiter: Arc::new(RateLimiter::new()),
+            limiter: Arc::new(RateLimiter::memory()),
             http_requests: Arc::new(AtomicU64::new(0)),
             rpc: RpcClient::new("http://127.0.0.1:26657", 30),
             specs: Arc::new(SpecCache::new()),
             mounts: Arc::new(vec![]),
-            rpc_limiter: Arc::new(RateLimiter::new()),
+            rpc_limiter: Arc::new(RateLimiter::memory()),
             rpc_require_auth: false,
             rpc_anon_rate_limit: 100,
             metrics: Arc::new(MetricsCollector::new()),
@@ -788,7 +889,8 @@ pub(crate) mod integration_tests {
             health_max_lag_ledgers: 100,
             health_max_stale_secs: 120,
             metrics_require_auth: false,
-            proxy_limiter: Arc::new(RateLimiter::new()),
+            proxy_limiter: Arc::new(RateLimiter::memory()),
+            webhook_limiter: Arc::new(RateLimiter::memory()),
             config: Arc::new(crate::config::ApiConfig::test_default()),
             key_cache: Arc::new(KeyCache::new(256, std::time::Duration::from_secs(30), std::time::Duration::from_secs(5))),
             ip_config: IpConfig { trusted_proxy_hops: 0, platform_header: None },

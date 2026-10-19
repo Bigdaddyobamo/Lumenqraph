@@ -63,6 +63,9 @@ pub async fn metrics(State(state): State<AppState>) -> ApiResult<impl IntoRespon
          # HELP lumenqraph_indexer_errors_total Indexer poll-cycle errors\n\
          # TYPE lumenqraph_indexer_errors_total counter\n\
          lumenqraph_indexer_errors_total {errors}\n\
+         # HELP lumenqraph_rate_limit_backend_errors_total Redis rate-limit backend errors (each applies the configured fail mode)\n\
+         # TYPE lumenqraph_rate_limit_backend_errors_total counter\n\
+         lumenqraph_rate_limit_backend_errors_total {rate_limit_backend_errors}\n\
          # HELP lumenqraph_consecutive_errors Current number of consecutive poll-cycle failures (circuit breaker gauge; resets to 0 on success)\n\
          # TYPE lumenqraph_consecutive_errors gauge\n\
          lumenqraph_consecutive_errors {consecutive_errors}\n\
