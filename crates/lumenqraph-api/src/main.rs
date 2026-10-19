@@ -221,7 +221,7 @@ async fn main() -> anyhow::Result<()> {
             std::time::Duration::from_secs(config.api_key_cache_neg_ttl_secs),
         )),
         ip_config: auth::IpConfig::from_env(),
-        audit_tx: None,
+        audit_tx: Some(audit_tx),
         audit_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         shutdown: shutdown.clone(),
     };

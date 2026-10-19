@@ -9,7 +9,7 @@
 //! callers with the "admin" role (not yet implemented) — they are simply
 //! unreachable from normal keys.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::response::Response;
 use axum::{Extension, Json};
 use lumenqraph_core::WebhookSubscription;
@@ -389,11 +389,17 @@ type WebhookListRow = (
 );
 
 /// List subscriptions without exposing their secrets.
-pub async fn list_webhooks(State(state): State<AppState>) -> ApiResult<Json<Vec<Value>>> {
+///
+/// Only subscriptions owned by the caller's key are returned (#561).
+pub async fn list_webhooks(
+    State(state): State<AppState>,
+    Extension(caller): Extension<CallerKeyHash>,
+) -> ApiResult<Json<Vec<Value>>> {
     let rows: Vec<WebhookListRow> = sqlx::query_as(
         "SELECT id, url, kind, contract_id, event_name, contract_ids, event_names, filter, active, created_at, auto_disabled_at, auto_disabled_reason
-             FROM webhook_subscriptions ORDER BY created_at DESC",
+             FROM webhook_subscriptions WHERE owner_key_hash = $1 ORDER BY created_at DESC",
     )
+    .bind(&caller.0)
     .fetch_all(&state.pool)
     .await?;
 
@@ -660,8 +666,9 @@ pub async fn delete_webhook(
     caller: Option<Extension<CallerKeyHash>>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    let result = sqlx::query("DELETE FROM webhook_subscriptions WHERE id = $1")
+    let result = sqlx::query("DELETE FROM webhook_subscriptions WHERE id = $1 AND owner_key_hash = $2")
         .bind(id)
+        .bind(&caller.0)
         .execute(&state.pool)
         .await?;
 
@@ -728,14 +735,16 @@ fn default_deliveries_limit() -> i64 {
 /// paginated on the delivery `id`.
 pub async fn list_webhook_deliveries(
     State(state): State<AppState>,
+    Extension(caller): Extension<CallerKeyHash>,
     Path(id): Path<Uuid>,
     Query(q): Query<DeliveriesQuery>,
 ) -> ApiResult<Response> {
     let page = PageRequest::<IdCursor>::parse(q.limit, 500, q.offset, q.after.as_deref())?;
 
     let exists: bool =
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM webhook_subscriptions WHERE id = $1)")
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM webhook_subscriptions WHERE id = $1 AND owner_key_hash = $2)")
             .bind(id)
+            .bind(&caller.0)
             .fetch_one(&state.pool)
             .await?;
     if !exists {
@@ -802,6 +811,7 @@ const REDRIVE_JITTER_SECS: f64 = 300.0;
 /// (optionally only those created at or after `since`) back to pending.
 pub async fn redrive_webhook(
     State(state): State<AppState>,
+    Extension(caller): Extension<CallerKeyHash>,
     Path(id): Path<Uuid>,
     Query(query): Query<RedriveQuery>,
 ) -> ApiResult<Json<Value>> {
@@ -867,6 +877,7 @@ pub async fn redrive_webhook(
 /// `POST /webhooks/:id/reenable` — clear an auto-disable and reactivate.
 pub async fn reenable_webhook(
     State(state): State<AppState>,
+    Extension(caller): Extension<CallerKeyHash>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
     let exists: bool =
@@ -881,9 +892,10 @@ pub async fn reenable_webhook(
     let affected = sqlx::query(
         "UPDATE webhook_subscriptions
          SET active = true, auto_disabled_at = NULL, auto_disabled_reason = NULL, consecutive_failures = 0
-         WHERE id = $1 AND auto_disabled_at IS NOT NULL",
+         WHERE id = $1 AND owner_key_hash = $2 AND auto_disabled_at IS NOT NULL",
     )
     .bind(id)
+    .bind(&caller.0)
     .execute(&state.pool)
     .await?
     .rows_affected();
@@ -960,6 +972,7 @@ pub async fn rotate_webhook_secret(
     .bind(&new_secret)
     .bind(encryption_key)
     .bind(id)
+    .bind(&caller.0)
     .fetch_optional(&state.pool)
     .await?;
 
