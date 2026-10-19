@@ -626,7 +626,7 @@ The agent calls `get_contract_interface` to discover the typed signatures, then 
 
 ## Webhooks
 
-Register a URL (with optional contract/event filters) and receive event pushes as they're indexed. Each delivery carries an `X-Lumenqraph-Signature: sha256=<hmac>` header — an HMAC-SHA256 of the raw request body, keyed by the `secret` returned once at creation.
+Register a URL (with optional contract/event filters) and receive event pushes as they're indexed. Each delivery carries a timestamped `X-Lumenqraph-Signature: t=<timestamp>,v1=<hmac>` header — an HMAC-SHA256 of the timestamp and raw request body, keyed by the `secret` returned once at creation.
 
 ```bash
 curl -X POST localhost:8080/webhooks \
@@ -649,10 +649,22 @@ Verifying a delivery (Node.js):
 const crypto = require("crypto");
 
 function verify(rawBody, signatureHeader, secret) {
-  const expected =
-    "sha256=" + crypto.createHmac("sha256", secret).update(rawBody).digest("hex");
+  const [timestamp, signature] = signatureHeader.split(",");
+  const t = timestamp?.slice(2);
+  const v1 = signature?.slice(3);
+  const parsedTimestamp = Number(t);
+  if (
+    !Number.isFinite(parsedTimestamp) ||
+    !v1 ||
+    Math.abs(Date.now() / 1000 - parsedTimestamp) > 300
+  ) return false;
+  const expected = crypto
+    .createHmac("sha256", secret)
+    .update(`${t}.${rawBody}`)
+    .digest("hex");
+  if (v1.length !== expected.length) return false;
   return crypto.timingSafeEqual(
-    Buffer.from(signatureHeader),
+    Buffer.from(v1),
     Buffer.from(expected)
   );
 }

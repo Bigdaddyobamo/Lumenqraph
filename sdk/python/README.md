@@ -135,7 +135,8 @@ lq = LumenqraphClient(
 
 ### Webhook Signature Verification
 
-Verify incoming webhook signatures for security:
+Verify incoming timestamped webhook signatures for security. Signatures older
+than five minutes are rejected by default:
 
 ```python
 from lumenqraph import verify_webhook_signature

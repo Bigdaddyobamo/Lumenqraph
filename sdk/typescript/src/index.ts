@@ -1144,7 +1144,7 @@ export class LumenqraphClient {
  *
  * @param rawBody         Raw HTTP request body (string or bytes).
  * @param signatureHeader Value of the `X-Lumenqraph-Signature` header,
- *                        e.g. `"t=1727090000,v1=abcdef…"` or legacy `"sha256=abcdef…"`.
+ *                        e.g. `"t=1727090000,v1=abcdef…"`.
  * @param secret          The subscription secret returned at creation time.
  * @param toleranceSecs   Maximum age of the timestamp in seconds (default: 300 = 5 minutes).
  *                        Set to 0 to disable timestamp validation (not recommended).
@@ -1172,14 +1172,7 @@ export async function verifyWebhook(
   secret: string,
   toleranceSecs: number = 300,
 ): Promise<boolean> {
-  // Try new timestamped format first: "t=<timestamp>,v1=<hex>"
-  if (signatureHeader.includes("t=") && signatureHeader.includes("v1=")) {
-    return verifyTimestampedSignature(rawBody, signatureHeader, secret, toleranceSecs);
-  }
-
-  // Fall back to legacy format: "sha256=<hex>"
-  // This path will be removed in a future release (deprecated)
-  return verifyLegacySignature(rawBody, signatureHeader, secret);
+  return verifyTimestampedSignature(rawBody, signatureHeader, secret, toleranceSecs);
 }
 
 async function verifyTimestampedSignature(
@@ -1263,51 +1256,6 @@ async function verifyTimestampedSignature(
   return false;
 }
 
-async function verifyLegacySignature(
-  rawBody: string | Uint8Array,
-  signatureHeader: string,
-  secret: string,
-): Promise<boolean> {
-  // Parse off the "sha256=" prefix. An absent or wrong prefix is an invalid
-  // signature, not a fatal error.
-  const prefix = "sha256=";
-  if (!signatureHeader.startsWith(prefix)) return false;
-  const providedHex = signatureHeader.slice(prefix.length);
-
-  // Encode inputs.
-  const enc = new TextEncoder();
-  const keyBuffer = enc.encode(secret).buffer as ArrayBuffer;
-  const bodyBytes: ArrayBuffer =
-    typeof rawBody === "string"
-      ? (enc.encode(rawBody).buffer as ArrayBuffer)
-      : (rawBody.buffer.slice(rawBody.byteOffset, rawBody.byteOffset + rawBody.byteLength) as ArrayBuffer);
-
-  // Import the secret as an HMAC-SHA-256 key via Web Crypto
-  const cryptoKey = await crypto.subtle.importKey(
-    "raw",
-    keyBuffer,
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-
-  // Compute the expected signature.
-  const sigBuffer = await crypto.subtle.sign("HMAC", cryptoKey, bodyBytes);
-  const expectedHex = bufToHex(sigBuffer);
-
-  // Constant-time comparison
-  if (expectedHex.length !== providedHex.length) return false;
-
-  const expectedBytes = enc.encode(expectedHex);
-  const providedBytes = enc.encode(providedHex);
-
-  let diff = 0;
-  for (let i = 0; i < expectedBytes.length; i++) {
-    // biome-ignore lint: intentional constant-time compare
-    diff |= (expectedBytes[i] ?? 0) ^ (providedBytes[i] ?? 0);
-  }
-  return diff === 0;
-}
 
 // ---- Retry helpers (#81) ----
 

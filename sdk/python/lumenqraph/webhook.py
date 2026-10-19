@@ -40,7 +40,7 @@ def verify_webhook_signature(
     Args:
         body:              Raw HTTP request body as a string.
         signature_header:  Value of the ``X-Lumenqraph-Signature`` header,
-                           e.g. ``"t=1727090000,v1=abcdef…"`` or legacy ``"sha256=abcdef…"``.
+                           e.g. ``"t=1727090000,v1=abcdef…"``.
         secret:            The subscription secret returned at creation time.
         tolerance_secs:    Maximum age of the timestamp in seconds (default: 300 = 5 minutes).
                            Set to 0 to disable timestamp validation (not recommended).
@@ -65,13 +65,7 @@ def verify_webhook_signature(
     if not signature_header or not secret:
         return False
 
-    # Try new timestamped format first: "t=<timestamp>,v1=<hex>"
-    if "t=" in signature_header and "v1=" in signature_header:
-        return _verify_timestamped_signature(body, signature_header, secret, tolerance_secs)
-
-    # Fall back to legacy format: "sha256=<hex>"
-    # This path will be removed in a future release (deprecated)
-    return _verify_legacy_signature(body, signature_header, secret)
+    return _verify_timestamped_signature(body, signature_header, secret, tolerance_secs)
 
 
 def _verify_timestamped_signature(
@@ -125,25 +119,3 @@ def _verify_timestamped_signature(
             return True
 
     return False
-
-
-def _verify_legacy_signature(
-    body: str,
-    signature_header: str,
-    secret: str,
-) -> bool:
-    """Verify legacy signature format: sha256=<hex>"""
-    prefix = "sha256="
-    if not signature_header.startswith(prefix):
-        return False
-
-    provided_hex = signature_header[len(prefix):]
-
-    computed_hex = hmac.new(
-        secret.encode("utf-8"),
-        body.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-
-    # Constant-time comparison prevents timing-oracle attacks.
-    return hmac.compare_digest(computed_hex, provided_hex)
