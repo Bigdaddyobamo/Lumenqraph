@@ -182,6 +182,10 @@ async fn main() -> anyhow::Result<()> {
             .to_string(),
     });
 
+    // Cancelled by `shutdown_signal`; long-lived SSE streams watch it so they end
+    // promptly instead of holding graceful shutdown until the hard timeout (#571).
+    let shutdown = tokio_util::sync::CancellationToken::new();
+
     let state = AppState {
         pool,
         require_auth: config.require_auth,
@@ -218,7 +222,7 @@ async fn main() -> anyhow::Result<()> {
         ip_config: auth::IpConfig::from_env(),
         audit_tx: None,
         audit_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        shutdown: tokio_util::sync::CancellationToken::new(),
+        shutdown: shutdown.clone(),
     };
 
     // Resolve the RPC network passphrase in the background so /health never
@@ -304,6 +308,8 @@ async fn shutdown_signal(shutdown_timeout_secs: u64) {
         _ = ctrl_c => {}
         _ = terminate => {}
     }
+    // End long-lived streams now so axum's graceful shutdown can finish.
+    shutdown.cancel();
     info!(
         "shutdown signal received; draining in-flight requests (up to {}s)",
         shutdown_timeout_secs
