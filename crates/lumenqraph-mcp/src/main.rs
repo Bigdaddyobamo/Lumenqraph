@@ -61,6 +61,56 @@ where
     }
 }
 
+fn select_rpc_url(
+    configured: Option<&str>,
+    network_passphrase: Option<&str>,
+) -> anyhow::Result<String> {
+    if let Some(url) = configured.filter(|url| !url.trim().is_empty()) {
+        return Ok(url.to_string());
+    }
+
+    let passphrase = network_passphrase
+        .filter(|passphrase| !passphrase.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "RPC_URL is unset and indexer_cursor.network_passphrase is unavailable; \
+                 set RPC_URL explicitly or start the indexer first"
+            )
+        })?;
+
+    let url = match passphrase.trim() {
+        "Public Global Stellar Network ; September 2015" => "https://mainnet.sorobanrpc.com",
+        "Test SDF Network ; September 2015" => "https://soroban-testnet.stellar.org",
+        "Test SDF Future Network ; October 2022" => "https://rpc-futurenet.stellar.org",
+        _ => {
+            anyhow::bail!(
+                "RPC_URL is unset and no default RPC endpoint is known for indexed network \
+                 passphrase {passphrase:?}; set RPC_URL explicitly"
+            )
+        }
+    };
+    Ok(url.to_string())
+}
+
+async fn resolve_rpc_url(pool: &PgPool, configured: Option<String>) -> anyhow::Result<String> {
+    let network_passphrase = if configured
+        .as_deref()
+        .is_some_and(|url| !url.trim().is_empty())
+    {
+        None
+    } else {
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT network_passphrase FROM indexer_cursor WHERE id = 1",
+        )
+        .fetch_optional(pool)
+        .await
+        .context("failed to read indexer_cursor.network_passphrase")?
+        .flatten()
+    };
+
+    select_rpc_url(configured.as_deref(), network_passphrase.as_deref())
+}
+
 #[derive(Clone)]
 pub struct State {
     pub pool: PgPool,
@@ -89,8 +139,6 @@ async fn main() -> anyhow::Result<()> {
     lumenqraph_core::telemetry::init_tracing_stderr();
 
     let database_url = std::env::var("DATABASE_URL").context("missing DATABASE_URL")?;
-    let rpc_url = std::env::var("RPC_URL")
-        .unwrap_or_else(|_| "https://soroban-testnet.stellar.org".to_string());
     let rpc_timeout_secs: u64 = std::env::var("RPC_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.trim().parse().ok())
@@ -116,6 +164,7 @@ async fn main() -> anyhow::Result<()> {
         connect_retries: db_setting("MCP_DATABASE_CONNECT_RETRIES", "DATABASE_CONNECT_RETRIES", 30u32)?,
     };
     let pool = lumenqraph_core::db::connect_with_retry(&database_url, &db).await?;
+    let rpc_url = resolve_rpc_url(&pool, std::env::var("RPC_URL").ok()).await?;
     let state = State {
         pool,
         rpc: RpcClient::new(rpc_url, rpc_timeout_secs),
@@ -129,6 +178,42 @@ async fn main() -> anyhow::Result<()> {
 
     info!("lumenqraph MCP server ready (stdio)");
     serve(state).await
+}
+
+#[cfg(test)]
+mod rpc_url_tests {
+    use super::select_rpc_url;
+
+    #[test]
+    fn explicit_rpc_url_takes_precedence() {
+        assert_eq!(
+            select_rpc_url(Some("https://rpc.example.com"), Some("unknown")).unwrap(),
+            "https://rpc.example.com"
+        );
+    }
+
+    #[test]
+    fn defaults_follow_the_indexed_stellar_network() {
+        assert_eq!(
+            select_rpc_url(None, Some("Public Global Stellar Network ; September 2015")).unwrap(),
+            "https://mainnet.sorobanrpc.com"
+        );
+        assert_eq!(
+            select_rpc_url(None, Some("Test SDF Network ; September 2015")).unwrap(),
+            "https://soroban-testnet.stellar.org"
+        );
+        assert_eq!(
+            select_rpc_url(None, Some("Test SDF Future Network ; October 2022")).unwrap(),
+            "https://rpc-futurenet.stellar.org"
+        );
+    }
+
+    #[test]
+    fn unknown_or_missing_network_requires_an_explicit_rpc_url() {
+        assert!(select_rpc_url(None, Some("custom network")).is_err());
+        assert!(select_rpc_url(None, None).is_err());
+        assert!(select_rpc_url(Some("  "), None).is_err());
+    }
 }
 
 /// The stdio JSON-RPC loop: read a message per line, dispatch, write responses.

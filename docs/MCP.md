@@ -67,7 +67,7 @@ For stdio mode, log messages go to stderr so stdout stays a clean protocol chann
 | Variable | Required | Default | Notes |
 | --- | --- | --- | --- |
 | `DATABASE_URL` | ✅ | — | Postgres connection string, e.g. `postgres://user:pass@host:5432/db` |
-| `RPC_URL` | ❌ | `https://soroban-testnet.stellar.org` | Stellar RPC endpoint for `call_contract` and `simulate_call` |
+| `RPC_URL` | ❌ | Detected from the indexed network | Stellar RPC endpoint for `call_contract` and `simulate_call`; overrides automatic detection when set |
 | `RPC_TIMEOUT_SECS` | ❌ | `30` | Timeout for RPC calls in seconds |
 | `MCP_AUTH_TOKEN` | ❌ | — | Optional auth token required in `Authorization` field during `initialize` |
 
@@ -79,6 +79,13 @@ RPC_URL=https://soroban-testnet.stellar.org
 RPC_TIMEOUT_SECS=30
 MCP_AUTH_TOKEN=your-secret-token
 ```
+
+When `RPC_URL` is unset or blank, the MCP server reads
+`indexer_cursor.network_passphrase` and selects the matching public RPC endpoint
+for Stellar mainnet, testnet, or futurenet. The indexer must have stored its
+network passphrase before the MCP server starts. For custom networks or an
+uninitialized indexer, set `RPC_URL` explicitly; startup fails rather than
+silently sending RPC calls to the wrong network.
 
 ## Tools
 
