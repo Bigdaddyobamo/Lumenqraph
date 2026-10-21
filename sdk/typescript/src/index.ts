@@ -611,13 +611,10 @@ export class LumenqraphClient {
 
   /** Materialized SEP-41 transfers, newest first (cursor via `after`). */
   listTransfers(
-    contractId?: string,
+    contractId: string,
     opts: PageOptions & { from?: string; to?: string } = {},
   ): Promise<ListPage<Transfer>> {
-    const path = contractId
-      ? `/contracts/${enc(contractId)}/transfers`
-      : `/transfers`;
-    return this.get(path, {
+    return this.get(`/contracts/${enc(contractId)}/transfers`, {
       limit: opts.limit,
       offset: opts.offset,
       after: opts.after,

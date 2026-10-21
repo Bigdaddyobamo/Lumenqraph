@@ -140,7 +140,7 @@ const data = await lq.graphql<{ transfers: { edges: { node: unknown }[] } }>(`
 | `getDataKey(id, keyHash, { limit })` | `GET /contracts/:id/data/:keyHash` |
 | `listEvents(id, { limit, after, eventName })` | `GET /contracts/:id/events` |
 | `getStats(id, { bucket, groupBy, from, to, fromLedger, toLedger, resolution, window })` | `GET /contracts/:id/stats` |
-| `listTransfers(id?, { limit, after, from, to })` | `GET /contracts/:id/transfers` |
+| `listTransfers(id, { limit, after, from, to })` | `GET /contracts/:id/transfers` |
 | `listSwaps(id, { limit, after, sender, sellToken, buyToken })` | `GET /contracts/:id/swaps` |
 | `listNftEvents(id, { limit, after, kind, from, to, tokenId })` | `GET /contracts/:id/nfts` |
 | `listLiquidityEvents(id, { limit, after, kind, provider })` | `GET /contracts/:id/liquidity` |
