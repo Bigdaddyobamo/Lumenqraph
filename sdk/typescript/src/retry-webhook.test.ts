@@ -75,18 +75,13 @@ describe("verifyWebhook (#83)", () => {
   // Known-good fixture — produced by the same HMAC-SHA256 algorithm the server
   // uses in lumenqraph-webhooks/src/dispatcher.rs.
   //
-  //   echo -n 'hello world' | openssl dgst -sha256 -hmac 'secret'
-  //   => 734cc62f32841568f45715aeb9f4d7db
-  //      No — use:
-  //   node -e "const c=require('crypto');console.log('sha256='+c.createHmac('sha256','secret').update('hello world').digest('hex'))"
   const BODY = "hello world";
   const SECRET = "secret";
-  // Pre-computed via Node crypto:
-  // sha256=b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7
   let VALID_SIG: string;
 
   beforeEach(async () => {
     // Compute dynamically so the test is self-contained and cross-platform.
+    const timestamp = Math.floor(Date.now() / 1000);
     const enc = new TextEncoder();
     const key = await crypto.subtle.importKey(
       "raw",
@@ -95,11 +90,15 @@ describe("verifyWebhook (#83)", () => {
       false,
       ["sign"],
     );
-    const sig = await crypto.subtle.sign("HMAC", key, enc.encode(BODY));
+    const sig = await crypto.subtle.sign(
+      "HMAC",
+      key,
+      enc.encode(`${timestamp}.${BODY}`),
+    );
     const hex = Array.from(new Uint8Array(sig))
       .map((b) => b.toString(16).padStart(2, "0"))
       .join("");
-    VALID_SIG = `sha256=${hex}`;
+    VALID_SIG = `t=${timestamp},v1=${hex}`;
   });
 
   it("returns true for a valid signature (string body)", async () => {
@@ -120,9 +119,36 @@ describe("verifyWebhook (#83)", () => {
     expect(await verifyWebhook(BODY, tampered, SECRET)).toBe(false);
   });
 
-  it("returns false when the sha256= prefix is missing", async () => {
-    const noPrefix = VALID_SIG.replace("sha256=", "");
-    expect(await verifyWebhook(BODY, noPrefix, SECRET)).toBe(false);
+  it("rejects legacy body-only signatures", async () => {
+    const key = await crypto.subtle.importKey(
+      "raw",
+      new TextEncoder().encode(SECRET),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"],
+    );
+    const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(BODY));
+    const legacy = `sha256=${Array.from(new Uint8Array(sig))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("")}`;
+    expect(await verifyWebhook(BODY, legacy, SECRET)).toBe(false);
+  });
+
+  it("rejects expired timestamped signatures", async () => {
+    const timestamp = 1_600_000_000;
+    const enc = new TextEncoder();
+    const key = await crypto.subtle.importKey(
+      "raw",
+      enc.encode(SECRET),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"],
+    );
+    const sig = await crypto.subtle.sign("HMAC", key, enc.encode(`${timestamp}.${BODY}`));
+    const hex = Array.from(new Uint8Array(sig))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+    expect(await verifyWebhook(BODY, `t=${timestamp},v1=${hex}`, SECRET)).toBe(false);
   });
 
   it("returns false for a completely wrong secret", async () => {
@@ -134,9 +160,7 @@ describe("verifyWebhook (#83)", () => {
   });
 
   it("returns false when signature length differs (different secret length)", async () => {
-    // sha256= prefix + 64 hex chars is always 71 chars total; a truncated one
-    // should still fail cleanly (length mismatch in constant-time path).
-    const short = "sha256=aabb";
+    const short = "t=1700000000,v1=aabb";
     expect(await verifyWebhook(BODY, short, SECRET)).toBe(false);
   });
 });

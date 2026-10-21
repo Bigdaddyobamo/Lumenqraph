@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Basic usage examples for the Lumenqraph Python SDK."""
 
+import time
+
 from lumenqraph import LumenqraphClient, LumenqraphError
 
 
@@ -65,18 +67,20 @@ def example_webhook_verification():
     # Simulate receiving a webhook
     body_str = json.dumps({"event": "transfer", "amount": "1000"})
     secret = "your-webhook-secret"
+    timestamp = int(time.time())
 
-    # In a real app, this would come from the X-Webhook-Signature header
+    # In a real app, this would come from the X-Lumenqraph-Signature header
     import hmac
     import hashlib
     signature = hmac.new(
         secret.encode("utf-8"),
-        body_str.encode("utf-8"),
+        f"{timestamp}.{body_str}".encode("utf-8"),
         hashlib.sha256
     ).hexdigest()
+    signature_header = f"t={timestamp},v1={signature}"
 
     # Verify the signature
-    if verify_webhook_signature(body_str, signature, secret):
+    if verify_webhook_signature(body_str, signature_header, secret):
         print("Webhook signature is valid")
         data = json.loads(body_str)
         print(f"Event: {data['event']}")

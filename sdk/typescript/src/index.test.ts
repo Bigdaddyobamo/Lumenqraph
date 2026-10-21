@@ -1,6 +1,13 @@
 import { describe, it, expect, vi } from "vitest";
 import { LumenqraphClient, LumenqraphError } from "./index.js";
 
+type Assert<T extends true> = T;
+type TransferContractIdIsRequired = Assert<
+  undefined extends Parameters<LumenqraphClient["listTransfers"]>[0]
+    ? false
+    : true
+>;
+
 // ---- helpers ----
 
 /** Build a minimal event-shaped node for GraphQL page mocks. */
@@ -97,14 +104,6 @@ describe("URL construction", () => {
     expect(url.searchParams.get("limit")).toBe("10");
     expect(url.searchParams.get("offset")).toBe("20");
     expect(url.searchParams.get("event_name")).toBe("transfer");
-  });
-
-  it("listTransfers without contractId hits /transfers", async () => {
-    const f = mockFetch([{ status: 200, body: [] }]);
-    await client(f).listTransfers();
-    expect(new URL(f.mock.calls[0]?.[0] as string).pathname).toBe(
-      "/transfers",
-    );
   });
 
   it("listTransfers with contractId hits /contracts/:id/transfers", async () => {

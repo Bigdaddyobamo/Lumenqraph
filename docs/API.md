@@ -583,7 +583,7 @@ Contracts (no WASM spec) cannot be generated from.
 ### `POST /webhooks`
 Body: `{ "url": "https://...", "kind": "event", "contract_id": null, "event_name": "transfer" }`
 (all but `url` optional). Returns the subscription including a one-time `secret`
-used to verify the `X-Lumenqraph-Signature: sha256=<hmac>` header on deliveries.
+used to verify timestamped `X-Lumenqraph-Signature: t=<timestamp>,v1=<hmac>` headers.
 
 `kind` is `event` (default: a contract emitted an event; the payload is the event
 row) or `upgrade` (a contract's interface changed). `event_name` doesn't apply to
@@ -663,5 +663,7 @@ Delivery history and the subscription watermark are fully preserved — no
 deliveries are replayed and no events are missed.
 
 ### Verifying a delivery
-`HMAC-SHA256(secret, raw_request_body)` hex must equal the value after
-`sha256=` in `X-Lumenqraph-Signature`.
+The `v1` value is the hex-encoded `HMAC-SHA256(secret, "{timestamp}.{raw_request_body}")`.
+Validate the timestamp against a short tolerance window to prevent replay attacks;
+the Python and TypeScript SDK verifiers reject signatures more than five minutes old
+by default.
