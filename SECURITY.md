@@ -184,7 +184,7 @@ let mut mac = HmacSha256::new_from_slice(secret).unwrap();
 mac.update(body);
 let expected = hex::encode(mac.finalize().into_bytes());
 
-let provided = "sha256=abc123..."; // From X-Lumenqraph-Signature header
+let provided = "t=1727090000,v1=abc123..."; // From X-Lumenqraph-Signature header
 
 if verify_hmac_signature(&expected, provided) {
     // Signature is valid
@@ -197,16 +197,26 @@ The `verify_hmac_signature()` function uses the `subtle` crate's `ConstantTimeEq
 
 **JavaScript/Node.js implementation:**
 
-For consuming webhook signatures in Node.js, use the built-in `crypto.timingSafeEqual()`:
+For consuming webhook signatures in Node.js, validate the timestamp and use the built-in
+`crypto.timingSafeEqual()`:
 
 ```javascript
 const crypto = require("crypto");
 
 function verify(rawBody, signatureHeader, secret) {
-  const expected =
-    "sha256=" + crypto.createHmac("sha256", secret).update(rawBody).digest("hex");
+  const [timestamp, signature] = signatureHeader.split(",");
+  const t = timestamp?.slice(2);
+  const provided = signature?.slice(3);
+  const parsedTimestamp = Number(t);
+  if (
+    !Number.isFinite(parsedTimestamp) ||
+    !provided ||
+    Math.abs(Date.now() / 1000 - parsedTimestamp) > 300
+  ) return false;
+  const expected = crypto.createHmac("sha256", secret).update(`${t}.${rawBody}`).digest("hex");
+  if (provided.length !== expected.length) return false;
   return crypto.timingSafeEqual(
-    Buffer.from(signatureHeader),
+    Buffer.from(provided),
     Buffer.from(expected)
   );
 }

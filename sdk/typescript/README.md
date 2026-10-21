@@ -67,9 +67,9 @@ All other non-2xx responses are thrown immediately as `LumenqraphError`.
 
 ## Webhook signature verification (#83)
 
-Every webhook delivery carries an `X-Lumenqraph-Signature: sha256=<hmac>`
-header. Use the `verifyWebhook` helper — it uses the Web Crypto API for a
-**constant-time comparison** safe against timing attacks.
+Every webhook delivery carries an `X-Lumenqraph-Signature: t=<timestamp>,v1=<hmac>`
+header. Use the `verifyWebhook` helper — it enforces timestamp freshness and uses
+the Web Crypto API for a **constant-time comparison** safe against timing attacks.
 
 ```ts
 import { verifyWebhook } from "@lumenqraph/sdk";
@@ -78,7 +78,7 @@ import { verifyWebhook } from "@lumenqraph/sdk";
 app.post("/hook", express.raw({ type: "*/*" }), async (req, res) => {
   const valid = await verifyWebhook(
     req.body,                                           // raw Buffer or string
-    req.headers["x-lumenqraph-signature"] as string,   // "sha256=…"
+    req.headers["x-lumenqraph-signature"] as string,   // "t=…,v1=…"
     process.env.WEBHOOK_SECRET!,
   );
   if (!valid) return res.status(401).send("invalid signature");
@@ -90,7 +90,7 @@ app.post("/hook", express.raw({ type: "*/*" }), async (req, res) => {
 `verifyWebhook(rawBody, signatureHeader, secret): Promise<boolean>`
 
 - `rawBody` — `string` or `Uint8Array` (the raw, un-parsed request body).
-- `signatureHeader` — the full `X-Lumenqraph-Signature` header value, e.g. `"sha256=abc123…"`.
+- `signatureHeader` — the full `X-Lumenqraph-Signature` header value, e.g. `"t=1727090000,v1=abc123…"`.
 - `secret` — the subscription secret returned at webhook creation.
 
 ## Cursor pagination

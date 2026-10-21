@@ -2,20 +2,22 @@
 
 import hmac
 import hashlib
+import time
 import unittest
 from unittest.mock import patch
 
 from lumenqraph import LumenqraphClient, verify_webhook_signature
 
 
-def _sign(body: str, secret: str) -> str:
-    """Helper: compute the canonical ``sha256=<hex>`` signature."""
+def _sign(body: str, secret: str, timestamp: int | None = None) -> str:
+    """Helper: compute a timestamped webhook signature."""
+    timestamp = int(time.time()) if timestamp is None else timestamp
     digest = hmac.new(
         secret.encode("utf-8"),
-        body.encode("utf-8"),
+        f"{timestamp}.{body}".encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
-    return f"sha256={digest}"
+    return f"t={timestamp},v1={digest}"
 
 
 class TestWebhookSignature(unittest.TestCase):
@@ -28,11 +30,30 @@ class TestWebhookSignature(unittest.TestCase):
         sig = _sign(body, secret)
         self.assertTrue(verify_webhook_signature(body, sig, secret))
 
+    def test_rejects_legacy_signature(self):
+        """Legacy body-only signatures bypass replay protection and are rejected."""
+        body = '{"event": "test"}'
+        secret = "test-secret"
+        digest = hmac.new(
+            secret.encode("utf-8"),
+            body.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        self.assertFalse(verify_webhook_signature(body, f"sha256={digest}", secret))
+
+    def test_rejects_expired_signature(self):
+        """A valid signature outside the timestamp tolerance is rejected."""
+        body = '{"event": "test"}'
+        secret = "test-secret"
+        sig = _sign(body, secret, timestamp=1_600_000_000)
+        with patch("lumenqraph.webhook.time.time", return_value=1_700_000_000):
+            self.assertFalse(verify_webhook_signature(body, sig, secret))
+
     def test_invalid_signature(self):
         """Tampered hex value → False."""
         body = '{"event": "test"}'
         secret = "test-secret"
-        self.assertFalse(verify_webhook_signature(body, "sha256=deadbeef", secret))
+        self.assertFalse(verify_webhook_signature(body, "t=1700000000,v1=deadbeef", secret))
 
     def test_wrong_secret(self):
         """Correct format but wrong secret → False."""
@@ -40,8 +61,8 @@ class TestWebhookSignature(unittest.TestCase):
         sig = _sign(body, "correct-secret")
         self.assertFalse(verify_webhook_signature(body, sig, "wrong-secret"))
 
-    def test_missing_prefix(self):
-        """Signature without ``sha256=`` prefix → False."""
+    def test_missing_timestamped_format(self):
+        """Signature without timestamped fields → False."""
         body = '{"event": "test"}'
         secret = "test-secret"
         bare_hex = hmac.new(
@@ -49,7 +70,7 @@ class TestWebhookSignature(unittest.TestCase):
             body.encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
-        # No "sha256=" prefix → should be rejected
+        # Bare hex is not the timestamped header format.
         self.assertFalse(verify_webhook_signature(body, bare_hex, secret))
 
     def test_empty_signature(self):
