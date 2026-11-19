@@ -251,6 +251,8 @@ mod tests {
             upgrade_watch: false,
             reorg_overlap_ledgers: 0,
             rpc_timeout_secs: 30,
+            rpc_max_retry_after_secs: 60,
+            rpc_headers: Default::default(),
             max_consecutive_errors: 20,
             degraded_poll_interval_secs: 30,
             enrichment_warn_threshold: 0.5,

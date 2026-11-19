@@ -341,7 +341,12 @@ async fn main() -> anyhow::Result<()> {
 
     // Build the RPC client with all configured endpoints (#398).
     // RPC_URLS takes precedence over RPC_URL; both are parsed by Config::from_env.
-    let rpc = RpcClient::with_urls(config.rpc_urls.clone(), config.rpc_timeout_secs);
+    let rpc = RpcClient::with_urls_and_headers(
+        config.rpc_urls.clone(),
+        config.rpc_timeout_secs,
+        config.rpc_headers.clone(),
+    )
+    .with_max_retry_after(std::time::Duration::from_secs(config.rpc_max_retry_after_secs));
     // Only commands that use the RPC need a reachable endpoint, and then only
     // one of them (#713). `migrate` and `deep-backfill` make no RPC calls.
     let live_passphrase = if matches!(command, Command::Migrate | Command::DeepBackfill { .. }) {
