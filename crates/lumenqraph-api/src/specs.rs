@@ -67,6 +67,7 @@ const REVALIDATE_AFTER: Duration = Duration::from_secs(5);
 /// callers that need the original bytes. `parsed` is `None` when the section
 /// doesn't parse — the read layer tolerates that, the diff endpoints don't.
 pub struct CachedSpec {
+    #[allow(dead_code)] // raw bytes for callers that re-parse; not read yet
     pub section: Vec<u8>,
     pub parsed: Option<ContractSpec>,
     /// Hash of the WASM this interface was parsed from. Part of the `/call`
@@ -74,21 +75,17 @@ pub struct CachedSpec {
     pub wasm_hash: String,
 }
 
-/// A `current` entry, with the row version it was parsed from.
-struct CurrentEntry {
-    /// `contract_specs.wasm_hash` at parse time.
-    wasm_hash: String,
-    /// `contract_specs.fetched_at` at parse time.
-    fetched_at: DateTime<Utc>,
-    /// When the row was last validated against Postgres.
-    checked_at: Instant,
-    spec: Arc<CachedSpec>,
-}
+/// One `current` cache entry: (wasm_hash, fetched_at, parsed spec).
+type CurrentEntry = (String, DateTime<Utc>, Arc<CachedSpec>);
 
+#[derive(Default)]
 pub struct SpecCache {
-    /// contract_id -> entry. A `Mutex` rather than an `RwLock`, because an LRU
-    /// must reorder on every read.
-    current: Mutex<LruCache<String, CurrentEntry>>,
+    /// contract_id -> (wasm_hash the entry was parsed from, contract_specs.fetched_at
+    /// at parse time, entry). `wasm_hash` changing is the primary invalidation
+    /// signal (a real upgrade); `fetched_at` is compared alongside it so a write
+    /// to the row is never missed even in the cases hash equality alone wouldn't
+    /// cover.
+    current: RwLock<HashMap<String, CurrentEntry>>,
     /// (contract_id, version) -> entry. Immutable once observed.
     versions: Mutex<LruCache<(String, i32), Arc<CachedSpec>>>,
 }
@@ -159,9 +156,13 @@ impl SpecCache {
         // `wasm_hash` changing means the contract was upgraded; `fetched_at` is
         // compared alongside it so any write to this row — including one made
         // by a code path this cache doesn't specifically know about — is never
-        // missed.
-        if let Some(spec) = self.revalidate(contract_id, &wasm_hash, fetched_at) {
-            return Ok(spec);
+        // missed, with no reliance on a TTL.
+        if let Some((hash, cached_fetched_at, spec)) = self.current.read().unwrap().get(contract_id)
+        {
+            if *hash == wasm_hash && *cached_fetched_at >= fetched_at {
+                return Ok(Arc::clone(spec));
+            }
+            // Fall through: the contract's spec row changed since we cached it.
         }
 
         let section: Option<(String,)> =
@@ -179,16 +180,7 @@ impl SpecCache {
                  /call or /simulate.",
                 )
             })?;
-        let entry = parse(&hex_section, &wasm_hash)?;
-        Ok(self.store_current(contract_id, wasm_hash, fetched_at, entry))
-    }
-
-    /// The entry for `contract_id` if it was validated within [`REVALIDATE_AFTER`].
-    fn fresh_current(&self, contract_id: &str) -> Option<Arc<CachedSpec>> {
-        let mut map = self.current.lock();
-        let entry = map.get(contract_id)?;
-        (entry.checked_at.elapsed() < REVALIDATE_AFTER).then(|| Arc::clone(&entry.spec))
-    }
+        let entry = Arc::new(parse(&hex_section, &wasm_hash)?);
 
     /// Re-validate a cached entry against the row's current `wasm_hash` and
     /// `fetched_at`. On success the entry is marked as checked now and returned.
@@ -206,28 +198,11 @@ impl SpecCache {
             entry.checked_at = Instant::now();
             return Some(Arc::clone(&entry.spec));
         }
-        None
-    }
-
-    /// Insert a freshly parsed `current` entry, evicting the LRU entry if full.
-    fn store_current(
-        &self,
-        contract_id: &str,
-        wasm_hash: String,
-        fetched_at: DateTime<Utc>,
-        spec: CachedSpec,
-    ) -> Arc<CachedSpec> {
-        let spec = Arc::new(spec);
-        self.current.lock().put(
+        map.insert(
             contract_id.to_string(),
-            CurrentEntry {
-                wasm_hash,
-                fetched_at,
-                checked_at: Instant::now(),
-                spec: Arc::clone(&spec),
-            },
+            (wasm_hash, fetched_at, Arc::clone(&entry)),
         );
-        spec
+        Ok(entry)
     }
 
     /// The contract's interface at a historical version. Cached without
