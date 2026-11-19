@@ -16,6 +16,7 @@ export default defineConfig({
     trace: 'on-first-retry',
   },
   webServer: {
+    // Serve the repository root so the tests' /explorer/index.html paths resolve.
     command: process.env['SKIP_SERVER'] ? '' : 'npm run build && npx http-server .. -p 8080',
     url: 'http://localhost:8080/explorer/index.html',
     timeout: 120_000,
