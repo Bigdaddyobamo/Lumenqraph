@@ -4,7 +4,7 @@
 //! RPC returns different content for a recently-passed ledger.
 //! Transfer events are additionally projected into the materialized `token_transfers` table.
 
-use lumenqraph_core::NewEvent;
+pub use lumenqraph_core::NewEvent;
 use serde_json::Value;
 use sqlx::{PgPool, Row};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,6 +17,7 @@ static TRANSFER_PROJECTION_SKIPPED: AtomicU64 = AtomicU64::new(0);
 
 /// Total number of transfer-like events skipped by the projection since process
 /// start. Exposed for the `lumenqraph_transfer_projection_skipped_total` metric.
+#[allow(dead_code)] // read by the metrics endpoint
 pub fn transfer_projection_skipped_total() -> u64 {
     TRANSFER_PROJECTION_SKIPPED.load(Ordering::Relaxed)
 }
@@ -808,6 +809,7 @@ mod tests {
     use super::*;
 
     use serde_json::json;
+
 
     /// Test resolver: treats every contract as a confirmed fungible token so the
     /// transfer projection itself is what the assertions exercise.

@@ -52,6 +52,7 @@ use tokio::sync::Mutex;
 use tracing::info;
 
 use config::Config;
+use lumenqraph_core::ContractSpec;
 use deep_backfill::{GalexieSource, HistoricalSource};
 use reenrich::ReenrichOptions;
 use rpc_client::RpcClient;
@@ -134,6 +135,7 @@ impl LeaderLock {
             .await
             .context("failed to acquire advisory-lock connection")?
             .detach();
+        info!("acquiring indexer leader lock (id {})", INDEXER_LOCK_ID);
         let acquired = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
             .bind(INDEXER_LOCK_ID)
             .fetch_one(&mut conn)
