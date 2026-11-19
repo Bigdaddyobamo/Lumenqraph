@@ -36,9 +36,9 @@ sha2.workspace = true
 uuid.workspace = true
 lru.workspace = true
 axum.workspace = true
-clap.workspace = true
 
 [dev-dependencies]
+lumenqraph-core = { workspace = true, features = ["db-test"] }
 hmac.workspace = true
 stellar-strkey.workspace = true
 tower = { workspace = true, features = ["util"] }
@@ -46,7 +46,6 @@ sha2.workspace = true
 reqwest.workspace = true
 criterion.workspace = true
 tokio.workspace = true
-tower.workspace = true
 
 [[bench]]
 name = "bench_indexer"
