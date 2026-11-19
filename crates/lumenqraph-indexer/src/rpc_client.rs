@@ -31,15 +31,35 @@ use stellar_xdr::curr::{
     LedgerKeyContractData, Limits, ReadXdr, ScAddress, ScVal, WriteXdr,
 };
 
-/// How long to wait before probing the primary again after a failover.
+/// How long to wait before probing the primary again after a failover. Also the
+/// minimum gap between two probes, so a dead primary is probed at most once per
+/// interval (#722).
 const PRIMARY_PROBE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Timeout for a fail-back probe. Much shorter than the request timeout, so a
+/// hung primary cannot hold up application traffic for a full RPC timeout (#722).
+const PRIMARY_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How far the primary's `latestLedger` may trail the active failover endpoint
+/// and still count as caught up enough to fail back to (#722).
+const FAILBACK_LEDGER_TOLERANCE: i64 = 10;
 
 /// Inner mutable state that the failover logic needs to update atomically.
 struct FailoverState {
     /// Index into `urls` of the currently active endpoint.
     active_idx: usize,
-    /// Wall-clock time of the last failover event, used to gate primary probes.
+    /// Wall-clock time of the last failover event. Gates the first primary probe.
     last_failover_at: Option<Instant>,
+    /// When the last primary probe started. Set before probing, so a probe that
+    /// fails still resets the timer (#722).
+    last_probe_at: Option<Instant>,
+    /// Per endpoint: whether its network passphrase has been verified since the
+    /// client last switched to it. Cleared on every switch (#721).
+    network_verified: Vec<bool>,
+    /// Per endpoint: the highest `latestLedger` seen from it since the client last
+    /// switched to it. Tips only move forward, so a value that already covers a
+    /// cursor answers the cursor check without another call (#720, #721).
+    known_tip: Vec<Option<i64>>,
 }
 
 pub struct RpcClient {
@@ -367,6 +387,7 @@ impl RpcClient {
     /// URL is the primary; the rest are tried in order on retryable failures.
     pub fn with_urls(urls: Vec<String>, timeout_secs: u64) -> Self {
         assert!(!urls.is_empty(), "at least one RPC URL is required");
+        let n_urls = urls.len();
         // A request timeout is essential for a 24/7 poller: without it, a hung
         // RPC connection blocks the poll loop indefinitely and the backoff path
         // (which only fires on an error) is never reached.
@@ -380,6 +401,9 @@ impl RpcClient {
             failover: Mutex::new(FailoverState {
                 active_idx: 0,
                 last_failover_at: None,
+                last_probe_at: None,
+                network_verified: vec![false; n_urls],
+                known_tip: vec![None; n_urls],
             }),
             calls_made: AtomicU64::new(0),
             calls_failed: AtomicU64::new(0),
@@ -536,6 +560,10 @@ impl RpcClient {
                 );
                 state.active_idx = next;
                 state.last_failover_at = Some(Instant::now());
+                // Anything cached about the new endpoint is from before this
+                // switch as far as we're concerned, so re-verify it (#721).
+                state.network_verified[next] = false;
+                state.known_tip[next] = None;
                 self.active_url_idx.store(next, Ordering::Relaxed);
                 self.failover_count.fetch_add(1, Ordering::Relaxed);
             }
@@ -578,16 +606,68 @@ impl RpcClient {
         let ok = matches!(result, Ok(r) if r.status().is_success());
         if ok {
             let mut state = self.failover.lock().unwrap();
-            if state.active_idx != 0 {
-                tracing::info!(
-                    endpoint = %host_of(primary_url),
-                    "primary rpc endpoint recovered; failing back"
+            if state.active_idx == 0 {
+                return;
+            }
+            let due_since_failover = state
+                .last_failover_at
+                .is_some_and(|t| t.elapsed() >= PRIMARY_PROBE_INTERVAL);
+            let due_since_probe = state
+                .last_probe_at
+                .is_none_or(|t| t.elapsed() >= PRIMARY_PROBE_INTERVAL);
+            if !(due_since_failover && due_since_probe) {
+                return;
+            }
+            state.last_probe_at = Some(Instant::now());
+            state.known_tip[state.active_idx]
+        };
+
+        match self.probe_primary(active_tip).await {
+            Ok(()) => {
+                let mut state = self.failover.lock().unwrap();
+                if state.active_idx != 0 {
+                    tracing::info!(
+                        endpoint = %host_of(&self.urls[0]),
+                        "primary rpc endpoint recovered; failing back"
+                    );
+                    state.active_idx = 0;
+                    state.last_failover_at = None;
+                    self.active_url_idx.store(0, Ordering::Relaxed);
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    endpoint = %host_of(&self.urls[0]),
+                    error = %e,
+                    "primary rpc endpoint still unhealthy; staying on failover endpoint"
                 );
-                state.active_idx = 0;
-                state.last_failover_at = None;
-                self.active_url_idx.store(0, Ordering::Relaxed);
             }
         }
+    }
+
+    /// Check that the primary is fit to serve again. It must report `healthy`
+    /// from `getHealth`, pin the same network passphrase, and be no more than
+    /// `FAILBACK_LEDGER_TOLERANCE` ledgers behind the endpoint we are using.
+    /// Any HTTP 200 is not enough (#722).
+    async fn probe_primary(&self, active_tip: Option<i64>) -> anyhow::Result<()> {
+        let primary = self.urls[0].clone();
+        let health: RpcHealth = self
+            .raw_rpc(&primary, "getHealth", Some(PRIMARY_PROBE_TIMEOUT))
+            .await?;
+        anyhow::ensure!(
+            health.status == "healthy",
+            "primary reports status {:?}",
+            health.status
+        );
+        self.check_endpoint_network(0, Some(PRIMARY_PROBE_TIMEOUT)).await?;
+        if let Some(tip) = active_tip {
+            anyhow::ensure!(
+                health.latest_ledger + FAILBACK_LEDGER_TOLERANCE >= tip,
+                "primary latestLedger {} trails the active endpoint ({tip})",
+                health.latest_ledger
+            );
+        }
+        Ok(())
     }
 
     async fn call<P: Serialize, R: for<'de> Deserialize<'de>>(
@@ -605,7 +685,7 @@ impl RpcClient {
         &self,
         method: &str,
         params: P,
-        _cursor_ledger: Option<i64>,
+        cursor_ledger: Option<i64>,
     ) -> anyhow::Result<R> {
         let req = RpcRequest {
             jsonrpc: "2.0",
@@ -625,11 +705,10 @@ impl RpcClient {
         const BASE_DELAYS_MS: [u64; 2] = [1_000, 2_000];
 
         let mut last_err: Option<anyhow::Error> = None;
-        let initial_idx = self.active_url_idx.load(Ordering::Relaxed);
         // Try each URL at most once (primary + all failover candidates).
         let total_urls = self.urls.len();
 
-        for url_round in 0..total_urls {
+        for _ in 0..total_urls {
             let url_idx = {
                 let state = self.failover.lock().unwrap();
                 state.active_idx
@@ -742,7 +821,6 @@ impl RpcClient {
                 // No more candidates; give up.
                 break;
             }
-            let _ = (initial_idx, url_round); // suppress unused warnings
         }
 
         self.calls_failed.fetch_add(1, Ordering::Relaxed);
@@ -774,13 +852,21 @@ impl RpcClient {
         cursor: Option<String>,
         limit: u32,
     ) -> anyhow::Result<GetEventsResult> {
+        // A failover candidate must have reached the ledger just before the first
+        // one we ask for, i.e. the cursor we are resuming from (#720). Continuation
+        // pages carry a paging token instead, so there is no ledger to check.
+        let cursor_ledger = if cursor.is_some() {
+            None
+        } else {
+            start_ledger.map(|s| s.saturating_sub(1))
+        };
         let params = GetEventsParams {
             start_ledger: if cursor.is_some() { None } else { start_ledger },
             filters: event_filters(contract_ids)?,
             pagination: Pagination { limit, cursor },
             xdr_format: "base64",
         };
-        self.call("getEvents", params).await
+        self.call_with_cursor("getEvents", params, cursor_ledger).await
     }
 
     /// Fetch a contract's deployed WASM (hex hash + bytes), so its on-chain
@@ -1583,5 +1669,240 @@ mod tests {
             3,
             "must attempt exactly MAX_ATTEMPTS=3 times"
         );
+    }
+
+    // ── #720–#722 failover checks ─────────────────────────────────────────
+
+    const PASSPHRASE: &str = "Test SDF Network ; September 2015";
+
+    type Responder = Arc<dyn Fn(&str) -> (u16, String) + Send + Sync>;
+    type MethodLog = Arc<std::sync::Mutex<Vec<String>>>;
+
+    fn responder(f: impl Fn(&str) -> (u16, String) + Send + Sync + 'static) -> Responder {
+        Arc::new(f)
+    }
+
+    /// Mock RPC that records each JSON-RPC method it receives and answers with
+    /// `respond(method)` as `(http_status, body)`. Returns the URL and the log.
+    async fn spawn_method_mock(respond: Responder) -> (String, MethodLog) {
+        #[derive(Clone)]
+        struct S {
+            log: MethodLog,
+            respond: Responder,
+        }
+        async fn handler(State(s): State<S>, body: String) -> axum::response::Response {
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+            let method = v["method"].as_str().unwrap_or("").to_string();
+            s.log.lock().unwrap().push(method.clone());
+            let (status, payload) = (s.respond)(&method);
+            axum::response::Response::builder()
+                .status(status)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(payload))
+                .unwrap()
+        }
+        let log: MethodLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/", post(handler))
+            .with_state(S { log: log.clone(), respond });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), log)
+    }
+
+    fn method_count(log: &MethodLog, method: &str) -> usize {
+        log.lock().unwrap().iter().filter(|m| m.as_str() == method).count()
+    }
+
+    fn network_body() -> String {
+        format!(r#"{{"jsonrpc":"2.0","id":1,"result":{{"networkPassphrase":"{PASSPHRASE}"}}}}"#)
+    }
+
+    fn latest_body(seq: i64) -> String {
+        format!(r#"{{"jsonrpc":"2.0","id":1,"result":{{"sequence":{seq}}}}}"#)
+    }
+
+    fn health_body(status: &str, latest: i64) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":1,"result":{{"status":"{status}","latestLedger":{latest},"oldestLedger":1}}}}"#
+        )
+    }
+
+    fn events_body(latest: i64) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":1,"result":{{"latestLedger":{latest},"events":[],"cursor":null}}}}"#
+        )
+    }
+
+    /// Pin the network passphrase directly, as `validate_network_passphrases`
+    /// would at startup, without calling a primary that these tests break on purpose.
+    fn pin_passphrase(client: &RpcClient) {
+        *client.network_passphrase.lock().unwrap() = Some(PASSPHRASE.to_string());
+    }
+
+    /// Put the client on failover endpoint `idx`, as if it failed over at `failed_over_at`.
+    fn force_failover_state(client: &RpcClient, idx: usize, failed_over_at: Instant) {
+        let mut st = client.failover.lock().unwrap();
+        st.active_idx = idx;
+        st.last_failover_at = Some(failed_over_at);
+        st.last_probe_at = None;
+        drop(st);
+        client.active_url_idx.store(idx, Ordering::Relaxed);
+    }
+
+    #[tokio::test]
+    async fn failover_endpoint_network_checked_once_per_switch() {
+        // #721: primary down. Ten calls must send exactly one getNetwork to the
+        // secondary, not one before every call.
+        let (primary, _) = spawn_method_mock(responder(|_| (500, String::new()))).await;
+        let (secondary, log) = spawn_method_mock(responder(|m| match m {
+            "getNetwork" => (200, network_body()),
+            _ => (200, latest_body(2000)),
+        }))
+        .await;
+
+        let client = RpcClient::with_urls(vec![primary, secondary], 5);
+        pin_passphrase(&client);
+        for _ in 0..10 {
+            assert_eq!(client.get_latest_ledger().await.expect("secondary serves"), 2000);
+        }
+        assert_eq!(method_count(&log, "getNetwork"), 1, "one network check per switch");
+        assert_eq!(method_count(&log, "getLatestLedger"), 10);
+    }
+
+    #[tokio::test]
+    async fn failed_network_check_moves_on_to_next_candidate() {
+        // #721: a failing getNetwork on one secondary must not fail the call;
+        // the next secondary should be tried.
+        let (primary, _) = spawn_method_mock(responder(|_| (500, String::new()))).await;
+        let (bad, bad_log) = spawn_method_mock(responder(|_| (500, String::new()))).await;
+        let (good, _) = spawn_method_mock(responder(|m| match m {
+            "getNetwork" => (200, network_body()),
+            _ => (200, latest_body(2000)),
+        }))
+        .await;
+
+        let client = RpcClient::with_urls(vec![primary, bad, good], 5);
+        pin_passphrase(&client);
+        assert_eq!(client.get_latest_ledger().await.expect("third endpoint serves"), 2000);
+        assert_eq!(
+            method_count(&bad_log, "getLatestLedger"),
+            0,
+            "an endpoint that fails its network check must receive no application traffic"
+        );
+    }
+
+    #[tokio::test]
+    async fn lagging_failover_candidate_is_rejected_for_cursor() {
+        // #720: primary down, secondary tip = cursor - 50. The secondary must not
+        // be used for the page, and the rejection must be reported.
+        let (primary, _) = spawn_method_mock(responder(|_| (500, String::new()))).await;
+        let (secondary, log) = spawn_method_mock(responder(|m| match m {
+            "getNetwork" => (200, network_body()),
+            "getLatestLedger" => (200, latest_body(950)),
+            _ => (200, events_body(950)),
+        }))
+        .await;
+
+        let client = RpcClient::with_urls(vec![primary, secondary], 5);
+        pin_passphrase(&client);
+        // Resuming from cursor 1000 means the first wanted ledger is 1001.
+        let err = client
+            .get_events(Some(1001), &[], None, 10)
+            .await
+            .expect_err("lagging secondary must be rejected");
+        assert!(err.to_string().contains("behind the cursor"), "unexpected error: {err}");
+        assert_eq!(method_count(&log, "getEvents"), 0, "no page may come from a lagging endpoint");
+    }
+
+    #[tokio::test]
+    async fn failover_candidate_at_cursor_is_accepted() {
+        // #720 boundary: tip exactly equal to the cursor is enough.
+        let (primary, _) = spawn_method_mock(responder(|_| (500, String::new()))).await;
+        let (secondary, log) = spawn_method_mock(responder(|m| match m {
+            "getNetwork" => (200, network_body()),
+            "getLatestLedger" => (200, latest_body(1000)),
+            _ => (200, events_body(1000)),
+        }))
+        .await;
+
+        let client = RpcClient::with_urls(vec![primary, secondary], 5);
+        pin_passphrase(&client);
+        let page = client.get_events(Some(1001), &[], None, 10).await.expect("tip == cursor is accepted");
+        assert!(page.events.is_empty());
+        assert_eq!(method_count(&log, "getEvents"), 1);
+    }
+
+    #[tokio::test]
+    async fn primary_probe_runs_at_most_once_per_interval() {
+        // #722: a failed probe still resets the timer. Twenty calls while the
+        // primary is still down must produce one getHealth, not twenty.
+        let (primary, log) = spawn_method_mock(responder(|_| (500, String::new()))).await;
+        let (secondary, _) = spawn_method_mock(responder(|_| (200, latest_body(2000)))).await;
+
+        let client = RpcClient::with_urls(vec![primary, secondary], 5);
+        force_failover_state(&client, 1, Instant::now() - PRIMARY_PROBE_INTERVAL - Duration::from_secs(1));
+        for _ in 0..20 {
+            client.get_latest_ledger().await.expect("secondary serves");
+        }
+        assert_eq!(method_count(&log, "getHealth"), 1);
+        assert_eq!(client.active_url_idx.load(Ordering::Relaxed), 1, "still failed over");
+    }
+
+    #[tokio::test]
+    async fn http_200_with_rpc_error_is_not_failed_back_to() {
+        // #722: an HTTP 200 whose body is a JSON-RPC error is not a healthy primary.
+        let err_body = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"boom"}}"#;
+        let (primary, _) = spawn_method_mock(responder(move |_| (200, err_body.to_string()))).await;
+        let (secondary, _) = spawn_method_mock(responder(|m| match m {
+            "getNetwork" => (200, network_body()),
+            _ => (200, latest_body(2000)),
+        }))
+        .await;
+
+        let client = RpcClient::with_urls(vec![primary, secondary], 5);
+        pin_passphrase(&client);
+        force_failover_state(&client, 1, Instant::now() - PRIMARY_PROBE_INTERVAL - Duration::from_secs(1));
+        client.get_latest_ledger().await.expect("secondary serves");
+        assert_eq!(client.active_url_idx.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn unhealthy_primary_status_is_not_failed_back_to() {
+        let (primary, _) = spawn_method_mock(responder(|m| match m {
+            "getHealth" => (200, health_body("unhealthy", 2000)),
+            "getNetwork" => (200, network_body()),
+            _ => (200, latest_body(2000)),
+        }))
+        .await;
+        let (secondary, _) = spawn_method_mock(responder(|m| match m {
+            "getNetwork" => (200, network_body()),
+            _ => (200, latest_body(2000)),
+        }))
+        .await;
+
+        let client = RpcClient::with_urls(vec![primary, secondary], 5);
+        pin_passphrase(&client);
+        force_failover_state(&client, 1, Instant::now() - PRIMARY_PROBE_INTERVAL - Duration::from_secs(1));
+        client.get_latest_ledger().await.expect("secondary serves");
+        assert_eq!(client.active_url_idx.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn healthy_primary_fails_back() {
+        let (primary, _) = spawn_method_mock(responder(|m| match m {
+            "getHealth" => (200, health_body("healthy", 2000)),
+            "getNetwork" => (200, network_body()),
+            _ => (200, latest_body(2000)),
+        }))
+        .await;
+        let (secondary, _) = spawn_method_mock(responder(|_| (200, latest_body(2000)))).await;
+
+        let client = RpcClient::with_urls(vec![primary, secondary], 5);
+        pin_passphrase(&client);
+        force_failover_state(&client, 1, Instant::now() - PRIMARY_PROBE_INTERVAL - Duration::from_secs(1));
+        assert_eq!(client.get_latest_ledger().await.expect("primary serves"), 2000);
+        assert_eq!(client.active_url_idx.load(Ordering::Relaxed), 0, "fails back to primary");
     }
 }
