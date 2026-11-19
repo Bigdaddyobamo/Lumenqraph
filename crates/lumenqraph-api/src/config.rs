@@ -119,6 +119,8 @@ pub struct ApiConfig {
     /// Retention for delivered/failed webhook deliveries. `0` disables pruning.
     pub webhook_delivery_retention_days: i64,
 
+
+
     /// Sibling instances mounted under a path prefix (`INSTANCE_MOUNTS`).
     pub mounts: Vec<(String, String)>,
     pub proxy: ProxyConfig,
@@ -355,8 +357,6 @@ impl fmt::Debug for ApiConfig {
             .field("api_key_cache_ttl_secs", &self.api_key_cache_ttl_secs)
             .field("api_key_cache_neg_ttl_secs", &self.api_key_cache_neg_ttl_secs)
             .field("graphql", &self.graphql)
-            .field("admin_token", &self.admin_token.as_ref().map(|_| "[REDACTED]"))
-
             .field("webhook_encryption_key", &"[REDACTED]")
             .field(
                 "webhook_delivery_retention_days",

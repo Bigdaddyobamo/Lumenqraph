@@ -227,6 +227,8 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Check sensitive logging
         run: python3 scripts/check_sensitive_logging.py
+      - name: Test sensitive logging lint fixtures
+        run: python3 scripts/test_check_sensitive_logging.py
       - name: Check .env.example covers every env var
         run: python3 scripts/check_env_example.py
       - name: Install sqlx-cli
