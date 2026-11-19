@@ -34,6 +34,9 @@ mod specs;
 mod state;
 mod store;
 
+#[cfg(test)]
+mod projections_tests;
+
 #[cfg(all(test, feature = "smoke-tests"))]
 mod smoke;
 
@@ -85,7 +88,8 @@ enum Command {
     Run,
     /// One-shot catch-up within the RPC retention window.
     Backfill {
-        /// Start ledger; defaults to the persisted cursor or START_LEDGER.
+        /// Start ledger. When omitted, resumes at the persisted cursor + 1, or
+        /// at START_LEDGER if there is no cursor yet. Fails if neither exists.
         ledger: Option<u32>,
     },
     /// Gapless history from a data-lake export.
@@ -103,8 +107,10 @@ enum Command {
     RecoverGaps,
     /// Re-enrich historical events with newly available specs.
     Reenrich {
+        /// Only re-enrich events from this contract (a `C...` strkey).
         #[arg(long)]
         contract: Option<String>,
+        /// Recompute enrichment even for events that already have it.
         #[arg(long)]
         force: bool,
     },
@@ -114,8 +120,11 @@ enum Command {
     Migrate,
 }
 
+/// Holds the session-level Postgres advisory lock that makes exactly one
+/// live indexer the leader. The connection is pinged periodically; if it dies
+/// the lock is gone and the process exits so another instance can take over.
 struct LeaderLock {
-    conn: Arc<Mutex<PgConnection>>,
+    conn: Arc<tokio::sync::Mutex<PgConnection>>,
 }
 
 impl LeaderLock {
@@ -140,7 +149,7 @@ impl LeaderLock {
         }
         info!("indexer leader lock acquired; this instance is now active");
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
+            conn: Arc::new(tokio::sync::Mutex::new(conn)),
         })
     }
 
@@ -165,6 +174,19 @@ impl LeaderLock {
 fn skip_migrations() -> bool {
     matches!(
         std::env::var("SKIP_MIGRATIONS")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// Returns true when `ALLOW_NETWORK_CHANGE` is set to a truthy value. It lets
+/// the database be re-pinned to a different Soroban network (#714).
+fn allow_network_change() -> bool {
+    matches!(
+        std::env::var("ALLOW_NETWORK_CHANGE")
             .unwrap_or_default()
             .trim()
             .to_ascii_lowercase()
@@ -224,6 +246,54 @@ async fn inspect(rpc: &RpcClient, contract_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Resolve the start ledger for `backfill` (#711).
+///
+/// An explicit ledger always wins. Otherwise resume after the persisted cursor
+/// (`cursor + 1`), falling back to `START_LEDGER` when there is no cursor. A
+/// cursor of 0 means nothing has been processed yet, so it does not count.
+/// Never returns 0: starting from ledger 0 would backfill the whole retention
+/// window instead of resuming.
+fn resolve_backfill_start(
+    explicit: Option<u32>,
+    cursor: Option<i64>,
+    start_ledger: i64,
+) -> anyhow::Result<i64> {
+    if let Some(ledger) = explicit {
+        return Ok(i64::from(ledger));
+    }
+    if let Some(last) = cursor.filter(|c| *c > 0) {
+        return Ok(last + 1);
+    }
+    if start_ledger > 0 {
+        return Ok(start_ledger);
+    }
+    anyhow::bail!(
+        "no backfill start: no persisted cursor and START_LEDGER is unset; pass a ledger explicitly"
+    )
+}
+
+/// Check arguments that can be validated without touching the database or the
+/// RPC, so a typo fails immediately (#712).
+fn validate_args(command: &Command) -> anyhow::Result<()> {
+    if let Command::Reenrich {
+        contract: Some(contract),
+        ..
+    } = command
+    {
+        anyhow::ensure!(
+            lumenqraph_core::is_valid_contract_id(contract),
+            "invalid --contract '{contract}': expected a Soroban contract ID (C...)"
+        );
+    }
+    Ok(())
+}
+
+/// Bind address for the health/metrics HTTP server. Defaults to loopback so
+/// /health and /metrics are not exposed on public interfaces (#605).
+fn http_bind_addr() -> String {
+    std::env::var("INDEXER_HTTP_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:9090".to_string())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Parse arguments before touching any environment config so that
@@ -244,8 +314,15 @@ async fn main() -> anyhow::Result<()> {
     // Build the RPC client with all configured endpoints (#398).
     // RPC_URLS takes precedence over RPC_URL; both are parsed by Config::from_env.
     let rpc = RpcClient::with_urls(config.rpc_urls.clone(), config.rpc_timeout_secs);
-    let network_passphrase = rpc.validate_network_passphrases().await?;
-    info!(%network_passphrase, endpoints = config.rpc_urls.len(), "validated RPC network identity");
+    // Only commands that use the RPC need a reachable endpoint, and then only
+    // one of them (#713). `migrate` and `deep-backfill` make no RPC calls.
+    let live_passphrase = if matches!(command, Command::Migrate | Command::DeepBackfill { .. }) {
+        None
+    } else {
+        let network_passphrase = rpc.validate_network_passphrases().await?;
+        info!(%network_passphrase, endpoints = config.rpc_urls.len(), "validated RPC network identity");
+        Some(network_passphrase)
+    };
 
     match command {
         Command::Migrate => return run_migrations(&pool).await,
@@ -282,6 +359,15 @@ async fn main() -> anyhow::Result<()> {
         Command::Run => {
             let lock = LeaderLock::acquire(&pool).await?;
             lock.spawn_keepalive();
+
+            info!(
+                rpc_host = %rpc.active_endpoint_host(),
+                rpc_endpoints = config.rpc_urls.len(),
+                contracts = ?config.contract_ids,
+                poll_secs = config.poll_interval_secs,
+                "starting lumenqraph indexer (live)"
+            );
+
             let specs = Arc::new(specs::SpecCache::new(
                 config.spec_cache_max_entries,
                 config.spec_fetch_concurrency,

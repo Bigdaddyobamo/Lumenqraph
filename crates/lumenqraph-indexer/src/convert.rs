@@ -49,6 +49,8 @@ pub fn parse_ledger_closed_at(raw: &str) -> Option<DateTime<Utc>> {
 pub fn to_new_event(e: &EventInfo, spec: Option<&ContractSpec>) -> Option<NewEvent> {
     // Parse the timestamp. On failure, return None — never fall back to Utc::now().
     let parsed_ts = parse_ledger_closed_at(&e.ledger_closed_at)?;
+    // Unknown event types cannot satisfy the events.event_type CHECK; skip them.
+    let event_type = EventType::from_rpc_str(&e.event_type)?;
     // The ledger timestamp is authoritative. Backfill and catch-up routinely
     // ingest ledgers older than wall-clock tolerance, so never clamp it.
     let ledger_closed_at = parsed_ts;

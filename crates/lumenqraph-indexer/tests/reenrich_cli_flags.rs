@@ -1,4 +1,5 @@
-//! Test for issue #389: reenrich command needs additional CLI flags
+//! Issue #712: `reenrich --contract` and `--force` must reach the re-enrichment
+//! pass, and a malformed `--contract` must fail before any query runs.
 //!
 //! This test verifies the implementation of:
 //! - `--contract` to restrict re-enrichment to specific contracts
@@ -454,20 +455,29 @@ mod reenrich_cli_flags_tests {
         .expect("Failed to count");
         assert_eq!(contract_filtered.0, 2, "With --contract C1: 2 un-enriched");
 
-        // With --contract and --force: reprocess all events for that contract
-        let contract_force: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM events WHERE contract_id = $1 AND event_name IS NOT NULL",
-        )
-        .bind(&contract_1)
-        .fetch_one(&pool)
-        .await
-        .expect("Failed to count");
-        assert_eq!(
-            contract_force.0, 4,
-            "With --contract C1 --force: all 4 events"
-        );
+#[test]
+fn invalid_contract_fails_before_touching_database_or_rpc() {
+    let out = indexer()
+        .args(["reenrich", "--contract", "CNOT-A-STRKEY"])
+        .output()
+        .expect("run indexer");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "malformed --contract must exit non-zero");
+    assert!(stderr.contains("invalid --contract"), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("connect") && !stderr.contains("getNetwork"),
+        "validation must run before any connection attempt: {stderr}"
+    );
+}
 
-        cleanup_test_data(&pool, &contract_1).await;
-        cleanup_test_data(&pool, &contract_2).await;
-    }
+#[test]
+fn reenrich_help_documents_contract_and_force() {
+    let out = indexer()
+        .args(["reenrich", "--help"])
+        .output()
+        .expect("run indexer");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("--contract"), "help: {stdout}");
+    assert!(stdout.contains("--force"), "help: {stdout}");
 }

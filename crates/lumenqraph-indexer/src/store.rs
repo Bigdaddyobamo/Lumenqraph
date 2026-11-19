@@ -806,6 +806,10 @@ fn extract_liquidity_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fungible(_: &str) -> Option<ContractKind> {
+        Some(ContractKind::FungibleToken)
+    }
     use serde_json::json;
 
     /// Test resolver: treats every contract as a confirmed fungible token so the

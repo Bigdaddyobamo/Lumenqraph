@@ -615,6 +615,7 @@ pub async fn recover_gaps(
 
         let mut cursor_token: Option<String> = None;
         let mut total_inserted = 0u64;
+        let mut ts_parse_errors = 0u64; // #399
 
         loop {
             let page = rpc
@@ -656,6 +657,10 @@ pub async fn recover_gaps(
             if n < config.page_size as usize || cursor_token.is_none() {
                 break;
             }
+        }
+
+        if ts_parse_errors > 0 {
+            let _ = cursor::track_timestamp_parse_error(pool, ts_parse_errors).await;
         }
 
         sqlx::query("UPDATE missed_ranges SET recovered_at = NOW() WHERE id = $1")
