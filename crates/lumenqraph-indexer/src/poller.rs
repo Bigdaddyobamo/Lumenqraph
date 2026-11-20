@@ -187,11 +187,15 @@ pub async fn run(
                         && last_prune.is_none_or(|t| t.elapsed() >= PRUNE_INTERVAL)
                     {
                         // Never fatal: falling behind on disk reclamation is bad,
-                        // but stopping the tail over it is worse.
+                        // but stopping the tail over it is worse. Each sub-prune
+                        // is independent, so one failing table does not skip the
+                        // others. A failure is logged and counted, and pruning is
+                        // retried on the next PRUNE_INTERVAL rather than every
+                        // cycle, so a persistent failure cannot spin the poller.
                         if let Err(e) =
                             retention::prune(&pool, ledger, config.retention_ledgers).await
                         {
-                            warn!(error = %e, "retention prune failed");
+                            warn!(error = %e, "retention prune failed; will retry on next prune interval");
                         }
                         // Spec versions are pruned only here, so SPEC_VERSION_RETENTION
                         // (0 = keep only the current version) is always honoured (#748).
@@ -205,6 +209,9 @@ pub async fn run(
                         {
                             warn!(error = %e, "spec version retention prune failed");
                         }
+                        // Record the attempt regardless of outcome: the next
+                        // prune waits a full PRUNE_INTERVAL, so a failing prune
+                        // is retried with backoff instead of on every cycle.
                         last_prune = Some(Instant::now());
                     }
                 }

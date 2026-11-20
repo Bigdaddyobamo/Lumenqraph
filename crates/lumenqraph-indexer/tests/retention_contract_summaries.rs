@@ -178,6 +178,66 @@ mod retention_contract_summaries_tests {
         result.rows_affected()
     }
 
+    /// Insert a webhook_deliveries row for an event with the given status.
+    async fn insert_delivery(pool: &PgPool, delivery_id: &str, event_id: &str, status: &str) {
+        sqlx::query(
+            "INSERT INTO webhook_deliveries
+                 (delivery_id, subscription_id, event_id, status, attempts, created_at)
+             VALUES ($1, 'sub-1', $2, $3, 0, now())",
+        )
+        .bind(delivery_id)
+        .bind(event_id)
+        .bind(status)
+        .execute(pool)
+        .await
+        .expect("Failed to insert webhook delivery");
+    }
+
+    /// Count webhook_deliveries rows for an event.
+    async fn count_deliveries(pool: &PgPool, event_id: &str) -> i64 {
+        let row: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM webhook_deliveries WHERE event_id = $1")
+                .bind(event_id)
+                .fetch_one(pool)
+                .await
+                .expect("Failed to count deliveries");
+        row.0
+    }
+
+    /// Insert a contract_state row for a contract at a given ledger.
+    async fn insert_contract_state(pool: &PgPool, contract_id: &str, ledger: i64) {
+        sqlx::query(
+            "INSERT INTO contract_state (contract_id, key, ledger, durability, value)
+             VALUES ($1, 'k', $2, 'persistent', 'v')",
+        )
+        .bind(contract_id)
+        .bind(ledger)
+        .execute(pool)
+        .await
+        .expect("Failed to insert contract_state");
+    }
+
+    /// Count contract_state rows for a contract.
+    async fn count_contract_state(pool: &PgPool, contract_id: &str) -> i64 {
+        let row: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM contract_state WHERE contract_id = $1")
+                .bind(contract_id)
+                .fetch_one(pool)
+                .await
+                .expect("Failed to count contract_state");
+        row.0
+    }
+
+    /// Run the real retention pruner from the indexer crate.
+    async fn run_pruner(
+        pool: &PgPool,
+        tip: i64,
+        retention_ledgers: i64,
+    ) -> Result<lumenqraph_indexer::retention::PruneStats, sqlx::Error> {
+        lumenqraph_indexer::retention::prune(pool, tip, retention_ledgers, retention_ledgers)
+            .await
+    }
+
     #[tokio::test]
     #[ignore] // Requires TEST_DATABASE_URL
     async fn test_contract_summaries_decrements_on_pruning() {
