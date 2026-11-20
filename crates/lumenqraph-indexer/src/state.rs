@@ -27,8 +27,8 @@ use lumenqraph_core::xdr;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use stellar_xdr::curr::{
-    ContractDataDurability, ContractId, Hash, LedgerKey, LedgerKeyContractData, Limits, ScAddress,
-    ScVal, WriteXdr,
+    AccountId, Asset, ContractDataDurability, ContractId, Hash, LedgerKey, LedgerKeyAccount,
+    LedgerKeyContractData, LedgerKeyTrustLine, Limits, ScAddress, ScVal, TrustLineAsset, WriteXdr,
 };
 use tracing::{debug, warn};
 
@@ -252,11 +252,40 @@ pub async fn snapshot_balances_batch(
     // deduplicated by (contract_id, key_hash).
     let mut batch: Vec<(String, ScVal, ContractDataDurability, &str)> = Vec::new();
     let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    // Classic-account holders of SACs: (contract_id, holder, ledger key).
+    let mut trustline_batch: Vec<(String, String, LedgerKey)> = Vec::new();
+    let mut trustline_seen: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
     for (contract_id, holders) in holders_by_contract {
         if !contract_ids_filter.is_empty() && !contract_ids_filter.contains(contract_id) {
             continue;
         }
+        // Detect SACs once per contract; non-SACs keep the contract-data path.
+        let sac_asset = if holders.iter().any(|h| is_classic_account(h)) {
+            detect_sac_asset(rpc, contract_id).await
+        } else {
+            None
+        };
         for holder in holders {
+            if let Some(asset) = &sac_asset {
+                if is_classic_account(holder) {
+                    match trustline_ledger_key(holder, asset) {
+                        Ok(ledger_key) => {
+                            if trustline_seen.insert((contract_id.clone(), holder.clone())) {
+                                trustline_batch.push((
+                                    contract_id.clone(),
+                                    holder.clone(),
+                                    ledger_key,
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            debug!(holder, error = %e, "skipping unbuildable trustline key")
+                        }
+                    }
+                    continue;
+                }
+            }
             match keys::balance_key(balance_key_symbol, holder) {
                 Ok(key) => {
                     let key_hash = match key_hash_of(&key) {
@@ -288,7 +317,11 @@ pub async fn snapshot_balances_batch(
         );
     }
 
-    debug!(count = batch.len(), "batching holder balance key snapshots");
+    debug!(
+        contract_data = batch.len(),
+        trustlines = trustline_batch.len(),
+        "batching holder balance key snapshots"
+    );
 
     for chunk in batch.chunks(MAX_BATCH_KEYS) {
         if let Err(e) = snapshot_data_chunk(pool, rpc, chunk).await {
@@ -668,6 +701,7 @@ async fn try_write_snapshot_data(
     let key_xdr = key.to_xdr_base64(Limits::none())?;
     // Deprecated alias: sha256 of the base64 key text (durability-blind).
     let key_hash = hex::encode(Sha256::digest(key_xdr.as_bytes()));
+    let ledger_key_hash = ledger_key_hash(contract_id, key, durability)?;
 
     // Change detection: skip if we already have this key at this ledger.
     let latest: Option<i64> = sqlx::query_scalar(
