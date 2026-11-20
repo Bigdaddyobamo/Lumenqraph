@@ -591,6 +591,7 @@ fn default_data_limit() -> i64 {
 /// ledger, value, label, captured_at, deleted, archived).
 type DataRow = (
     String,
+    String,
     SqlxJson<Value>,
     String,
     i64,
@@ -625,7 +626,7 @@ pub async fn contract_data(
                         deleted, archived
                  FROM contract_data
                  WHERE contract_id = $1 AND ($2::text IS NULL OR label = $2)
-                 ORDER BY key_hash, ledger DESC
+                 ORDER BY ledger_key_hash, ledger DESC
              ) latest
              ORDER BY ledger DESC
              LIMIT $3",
@@ -697,17 +698,24 @@ pub struct DataHistoryQuery {
     limit: i64,
 }
 
-/// `GET /contracts/:id/data/:key_hash` — the version history of a single
+/// `GET /contracts/:id/data/:ledger_key_hash` — the version history of a single
 /// per-key entry (e.g. one holder's balance over time), newest first.
+///
+/// The path parameter is the ledger-key hash: `hex(sha256(xdr(LedgerKey)))`,
+/// which includes the entry's durability. Persistent and temporary entries
+/// with the same key therefore have separate histories (#741). For one release
+/// the legacy `key_hash` value is also accepted and resolved to its entry.
 pub async fn contract_data_key(
     State(state): State<AppState>,
     ValidContractId(contract_id): ValidContractId,
-    Path((_, key_hash)): Path<(String, String)>,
+    Path((_, ledger_key_hash)): Path<(String, String)>,
     Query(q): Query<DataHistoryQuery>,
 ) -> ApiResult<Json<Value>> {
     let limit = q.limit.clamp(1, 500);
     // (key, durability, ledger, value, label, captured_at, deleted, archived)
     type HistRow = (
+        String,
+        String,
         SqlxJson<Value>,
         String,
         i64,
@@ -717,17 +725,50 @@ pub async fn contract_data_key(
         bool,
         bool,
     );
+    // Match on the ledger-key hash. The legacy `key_hash` fallback is only
+    // consulted when no ledger-key hash matches, and is restricted to a single
+    // (key, durability) entry so it can never interleave two histories.
     let rows: Vec<HistRow> = sqlx::query_as(
         "SELECT key, durability, ledger, value, label, captured_at, deleted, archived
              FROM contract_data
-             WHERE contract_id = $1 AND key_hash = $2
+             WHERE contract_id = $1
+               AND ledger_key_hash = (
+                     SELECT ledger_key_hash FROM contract_data
+                     WHERE contract_id = $1 AND ledger_key_hash = $2
+                     LIMIT 1
+                   )
              ORDER BY ledger DESC LIMIT $3",
     )
     .bind(&contract_id)
-    .bind(&key_hash)
+    .bind(&ledger_key_hash)
     .bind(limit)
     .fetch_all(&state.pool)
     .await?;
+
+    let rows = if rows.is_empty() {
+        // Deprecated alias: resolve a legacy `key_hash` to one entry. If the
+        // key exists under both durabilities the alias is ambiguous, so pick
+        // the persistent entry deterministically rather than mixing them.
+        sqlx::query_as(
+            "SELECT ledger_key_hash, key_hash, key, durability, ledger, value, label, captured_at
+                 FROM contract_data
+                 WHERE contract_id = $1
+                   AND ledger_key_hash = (
+                         SELECT ledger_key_hash FROM contract_data
+                         WHERE contract_id = $1 AND key_hash = $2
+                         ORDER BY (durability = 'persistent') DESC, ledger_key_hash
+                         LIMIT 1
+                       )
+                 ORDER BY ledger DESC LIMIT $3",
+        )
+        .bind(&contract_id)
+        .bind(&ledger_key_hash)
+        .bind(limit)
+        .fetch_all(&state.pool)
+        .await?
+    } else {
+        rows
+    };
 
     if rows.is_empty() {
         return Err(ApiError::not_found("no data snapshots for this key"));
@@ -756,6 +797,8 @@ pub async fn contract_data_key(
         .collect();
     Ok(Json(json!({
         "contract_id": contract_id,
+        "ledger_key_hash": resolved_ledger_key_hash,
+        // Deprecated alias, kept for one release (#741).
         "key_hash": key_hash,
         "key": key,
         "durability": durability,
