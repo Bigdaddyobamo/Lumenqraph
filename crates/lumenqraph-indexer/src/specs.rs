@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 use futures::future::BoxFuture;
 use futures::FutureExt;
 use lru::LruCache;
-use lumenqraph_core::{ContractSpec, SpecDiff};
+use lumenqraph_core::{ContractKind, ContractSpec, SpecDiff};
 use sqlx::PgPool;
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
@@ -423,6 +423,36 @@ impl SpecCache {
             let _ = self.get(pool, rpc, contract_id, ledger).await;
         }
     }
+}
+
+/// Classify a contract from its parsed spec using well-known interface shapes.
+///
+/// Heuristics, checked in order (most specific first):
+/// - AMM: declares a `swap` event and `get_reserves`/`swap` functions.
+/// - NFT: declares `owner_of`/`token_uri` functions.
+/// - Liquidity pool: declares `deposit`/`withdraw` events and a `shares` field.
+/// - Fungible token: declares the SEP-41 `transfer`/`approve`/`balance` functions.
+///
+/// Returns `None` when the spec matches none of these shapes. SAC detection is
+/// left to `default_contract_kind`, which handles specs we never parse.
+fn classify_kind(spec: &ContractSpec) -> Option<ContractKind> {
+    let has_event = |name: &str| spec.events.iter().any(|e| e.name == name);
+    let has_function = |name: &str| spec.functions.iter().any(|f| f.name == name);
+    let has_field = |name: &str| spec.fields.iter().any(|f| f.name == name);
+
+    if has_event("swap") && (has_function("get_reserves") || has_function("swap")) {
+        return Some(ContractKind::Amm);
+    }
+    if has_function("owner_of") || has_function("token_uri") {
+        return Some(ContractKind::NonFungibleToken);
+    }
+    if (has_event("deposit") || has_event("withdraw")) && has_field("shares") {
+        return Some(ContractKind::LiquidityPool);
+    }
+    if has_function("transfer") && has_function("approve") && has_function("balance") {
+        return Some(ContractKind::FungibleToken);
+    }
+    None
 }
 
 /// Check whether `contract_id` has been upgraded, and if so re-read its
