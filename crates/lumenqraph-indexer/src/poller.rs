@@ -1026,7 +1026,9 @@ async fn fetch_and_upsert(
         }
 
         if !batch.is_empty() {
-            let (_, updated) = store::upsert_events(pool, &batch).await?;
+            let (_, updated) =
+                store::upsert_events_with_resolver(pool, &batch, &specs.contract_kind_resolver())
+                    .await?;
             total_updated += updated;
         }
 

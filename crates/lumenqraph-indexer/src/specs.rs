@@ -522,14 +522,9 @@ async fn load_persisted(
 
 /// Returns `(parsed spec, wasm hash, is_permanent_failure)`. The hash is present for any WASM contract
 /// (even if its spec fails to parse) and `None` for a Stellar Asset Contract.
-/// `is_permanent_failure` is true when the failure is not retryable (SAC, parse error),
+/// `is_permanent` is true when the failure is not retryable (SAC, parse error),
 /// and false for transient failures (RPC error).
-async fn load(
-    pool: &PgPool,
-    rpc: &RpcClient,
-    contract_id: &str,
-    ledger: i64,
-) -> (Option<Arc<ContractSpec>>, Option<String>, bool) {
+async fn load(pool: &PgPool, rpc: &RpcClient, contract_id: &str, ledger: i64) -> Loaded {
     let (wasm_hash, wasm) = match rpc.get_contract_wasm(contract_id).await {
         Ok(Some(w)) => w,
         Ok(None) => {
@@ -580,6 +575,11 @@ async fn load(
 
     let spec = parsed.spec;
     let complete = parsed.complete;
+    let kind = if is_sep41_token(&spec) {
+        ContractKind::FungibleToken
+    } else {
+        ContractKind::Unknown
+    };
 
     // The raw section (hex) lets the read layer re-parse exact argument types.
     let spec_section = lumenqraph_core::spec::spec_section_of(&wasm)
@@ -882,6 +882,83 @@ mod tests {
         .iter()
         .map(|r| (r.get(0), r.get(1), r.get(2)))
         .collect()
+    }
+
+    /// A spec section (hex) exposing exactly the named functions, each with the
+    /// given input arity, plus the ContractSpec it parses to.
+    fn spec_with_arities(functions: &[(&str, usize)]) -> (String, ContractSpec) {
+        let mut body = Vec::new();
+        for (name, arity) in functions {
+            let inputs: Vec<ScSpecTypeDef> = (0..*arity).map(|_| ScSpecTypeDef::U32).collect();
+            let entry = ScSpecEntry::FunctionV0(ScSpecFunctionV0 {
+                doc: "".try_into().unwrap(),
+                name: ScSymbol((*name).try_into().unwrap()),
+                inputs: inputs.try_into().unwrap(),
+                outputs: vec![ScSpecTypeDef::U32].try_into().unwrap(),
+            });
+            body.extend(entry.to_xdr(Limits::none()).unwrap());
+        }
+        let spec = ContractSpec::from_spec_xdr_simple(&body).expect("test spec should parse");
+        (hex::encode(&body), spec)
+    }
+
+    #[test]
+    fn a_sep41_spec_is_a_fungible_token() {
+        let (_, spec) = spec_with_arities(&[
+            ("balance", 1),
+            ("transfer", 3),
+            ("decimals", 0),
+            ("name", 0),
+            ("symbol", 0),
+        ]);
+        assert!(is_sep41_token(&spec));
+    }
+
+    #[test]
+    fn a_spec_without_decimals_is_not_a_fungible_token() {
+        // An NFT: has transfer/balance but no decimals.
+        let (_, spec) = spec_with_arities(&[("balance", 1), ("transfer", 3), ("name", 0)]);
+        assert!(!is_sep41_token(&spec));
+    }
+
+    #[test]
+    fn a_sac_contract_resolves_to_fungible_token() {
+        let cache = SpecCache::new(16, 1);
+        cache.inner.lock().unwrap().put(
+            "CSAC".to_string(),
+            Cached {
+                spec: CachedSpec::NoSpec,
+                wasm_hash: None,
+                kind: ContractKind::FungibleToken,
+            },
+        );
+        assert_eq!(
+            cache.contract_kind("CSAC"),
+            Some(ContractKind::FungibleToken)
+        );
+    }
+
+    #[test]
+    fn a_wasm_contract_without_decimals_is_not_a_fungible_token() {
+        let cache = SpecCache::new(16, 1);
+        let (_, spec) = spec_with_arities(&[("balance", 1), ("transfer", 3), ("name", 0)]);
+        let kind = if is_sep41_token(&spec) {
+            ContractKind::FungibleToken
+        } else {
+            ContractKind::Unknown
+        };
+        cache.inner.lock().unwrap().put(
+            "CNFT".to_string(),
+            Cached {
+                spec: CachedSpec::Spec(Arc::new(spec)),
+                wasm_hash: Some("hash".into()),
+                kind,
+            },
+        );
+        assert_ne!(
+            cache.contract_kind("CNFT"),
+            Some(ContractKind::FungibleToken)
+        );
     }
 
     #[tokio::test]
