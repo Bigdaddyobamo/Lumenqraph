@@ -14,6 +14,9 @@ use crate::specs::SpecCache;
 
 const BATCH_SIZE: i64 = 1000;
 const PROGRESS_EVERY_PAGES: u64 = 10;
+const BATCH_UPDATE_SQL: &str = "UPDATE events AS e SET enriched = batch.enriched
+     FROM UNNEST($1::text[], $2::jsonb[]) AS batch(event_id, enriched)
+     WHERE e.event_id = batch.event_id";
 
 #[derive(Debug, Clone, Default)]
 pub struct ReenrichOptions {
@@ -56,6 +59,7 @@ pub async fn run_reenrich(
     let mut last_progress_count = 0u64;
     let mut processed = 0u64;
     let mut updated = 0u64;
+    let mut cleared = 0u64;
     let mut pages = 0u64;
     let mut cursor: Option<(i64, String)> = None;
 
@@ -63,13 +67,15 @@ pub async fn run_reenrich(
         let rows = if let Some(contract) = options.contract.as_deref() {
             let query = if cursor.is_some() {
                 format!(
-                    "SELECT ledger, event_id, contract_id, decoded_topics, event_name, decoded_value
+                    "SELECT ledger, event_id, contract_id, decoded_topics, event_name, decoded_value,
+                            enriched IS NOT NULL AS had_enrichment
                      FROM events WHERE {filter} AND contract_id = $1 AND (ledger, event_id) > ($2, $3)
                      ORDER BY ledger, event_id LIMIT $4"
                 )
             } else {
                 format!(
-                    "SELECT ledger, event_id, contract_id, decoded_topics, event_name, decoded_value
+                    "SELECT ledger, event_id, contract_id, decoded_topics, event_name, decoded_value,
+                            enriched IS NOT NULL AS had_enrichment
                      FROM events WHERE {filter} AND contract_id = $1
                      ORDER BY ledger, event_id LIMIT $2"
                 )
@@ -82,13 +88,15 @@ pub async fn run_reenrich(
         } else {
             let query = if cursor.is_some() {
                 format!(
-                    "SELECT ledger, event_id, contract_id, decoded_topics, event_name, decoded_value
+                    "SELECT ledger, event_id, contract_id, decoded_topics, event_name, decoded_value,
+                            enriched IS NOT NULL AS had_enrichment
                      FROM events WHERE {filter} AND (ledger, event_id) > ($1, $2)
                      ORDER BY ledger, event_id LIMIT $3"
                 )
             } else {
                 format!(
-                    "SELECT ledger, event_id, contract_id, decoded_topics, event_name, decoded_value
+                    "SELECT ledger, event_id, contract_id, decoded_topics, event_name, decoded_value,
+                            enriched IS NOT NULL AS had_enrichment
                      FROM events WHERE {filter}
                      ORDER BY ledger, event_id LIMIT $1"
                 )
@@ -104,6 +112,11 @@ pub async fn run_reenrich(
             break;
         }
         pages += 1;
+        let mut batch_ids = Vec::with_capacity(rows.len());
+        let mut batch_enriched: Vec<Option<Json<serde_json::Value>>> =
+            Vec::with_capacity(rows.len());
+        let mut batch_updated = 0u64;
+        let mut batch_cleared = 0u64;
 
         for row in rows {
             let ledger: i64 = row.try_get("ledger")?;
@@ -122,6 +135,13 @@ pub async fn run_reenrich(
                 Ok(value) => value,
                 Err(error) => {
                     warn!(event_id, %error, "failed to decode event_name");
+                    continue;
+                }
+            };
+            let had_enrichment: bool = match row.try_get("had_enrichment") {
+                Ok(value) => value,
+                Err(error) => {
+                    warn!(event_id, %error, "failed to decode enrichment state");
                     continue;
                 }
             };
@@ -150,19 +170,33 @@ pub async fn run_reenrich(
                 .as_deref()
                 .and_then(|spec| spec.enrich_event(&event_name, &decoded_topics, &decoded_value));
             if let Some(enriched_json) = enriched {
-                if let Err(error) =
-                    sqlx::query("UPDATE events SET enriched = $1 WHERE event_id = $2")
-                        .bind(Json(enriched_json))
-                        .bind(&event_id)
-                        .execute(&pool)
-                        .await
-                {
-                    warn!(event_id, %error, "failed to update enriched field");
-                } else {
-                    updated += 1;
-                }
+                batch_ids.push(event_id);
+                batch_enriched.push(Some(Json(enriched_json)));
+                batch_updated += 1;
+            } else if options.force {
+                batch_ids.push(event_id.clone());
+                batch_enriched.push(None);
+                batch_cleared += u64::from(had_enrichment);
+                debug!(
+                    event_id,
+                    contract_id, event_name, "clearing stale enrichment"
+                );
             } else {
                 debug!(event_id, contract_id, event_name, "no enrichment available");
+            }
+        }
+
+        if !batch_ids.is_empty() {
+            if let Err(error) = sqlx::query(BATCH_UPDATE_SQL)
+                .bind(&batch_ids)
+                .bind(&batch_enriched)
+                .execute(&pool)
+                .await
+            {
+                warn!(rows = batch_ids.len(), %error, "failed to update enrichment batch");
+            } else {
+                updated += batch_updated;
+                cleared += batch_cleared;
             }
         }
 
@@ -184,11 +218,12 @@ pub async fn run_reenrich(
                 0.0
             };
             if is_tty {
-                eprintln!("Re-enriching… {processed:>10}/{total_events:<10} | {updated} updated | {throughput:.0} evt/s | ETA {eta_secs:.0}s");
+                eprintln!("Re-enriching… {processed:>10}/{total_events:<10} | {updated} updated | {cleared} cleared | {throughput:.0} evt/s | ETA {eta_secs:.0}s");
             }
             info!(
                 processed,
                 updated,
+                cleared,
                 total_events,
                 elapsed_secs = elapsed.as_secs(),
                 throughput = throughput as u64,
@@ -200,6 +235,6 @@ pub async fn run_reenrich(
         }
     }
 
-    info!(processed, updated, total_events, force = options.force, contract = ?options.contract, "re-enrichment pass complete");
+    info!(processed, updated, cleared, total_events, force = options.force, contract = ?options.contract, "re-enrichment pass complete");
     Ok(())
 }
