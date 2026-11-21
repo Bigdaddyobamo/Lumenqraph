@@ -31,8 +31,10 @@ Breaking changes will be documented in the changelog with migration guidance whe
 
 ### Fixed
 
-- Webhooks: stale pending deliveries for paused or auto-disabled subscriptions
-  now expire instead of pinning event retention forever (#751).
+- Indexer: `reenrich` reads and writes event JSONB columns with SQLx JSON types,
+  and malformed rows are logged and skipped instead of panicking the pass
+  (#752).
+
 - Python SDK: `Retry-After` is honoured on every retry, backoff uses full jitter,
   and cancelling an async call stops further retries (#634).
 - Docker image: the explorer bundle (`app.js`) is built in the image, so the
