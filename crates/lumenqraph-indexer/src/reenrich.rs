@@ -138,13 +138,6 @@ pub async fn run_reenrich(
                     continue;
                 }
             };
-            let had_enrichment: bool = match row.try_get("had_enrichment") {
-                Ok(value) => value,
-                Err(error) => {
-                    warn!(event_id, %error, "failed to decode enrichment state");
-                    continue;
-                }
-            };
             let Json(decoded_topics): Json<Vec<serde_json::Value>> =
                 match row.try_get("decoded_topics") {
                     Ok(value) => value,
@@ -170,17 +163,17 @@ pub async fn run_reenrich(
                 .as_deref()
                 .and_then(|spec| spec.enrich_event(&event_name, &decoded_topics, &decoded_value));
             if let Some(enriched_json) = enriched {
-                batch_ids.push(event_id);
-                batch_enriched.push(Some(Json(enriched_json)));
-                batch_updated += 1;
-            } else if options.force {
-                batch_ids.push(event_id.clone());
-                batch_enriched.push(None);
-                batch_cleared += u64::from(had_enrichment);
-                debug!(
-                    event_id,
-                    contract_id, event_name, "clearing stale enrichment"
-                );
+                if let Err(error) =
+                    sqlx::query("UPDATE events SET enriched = $1 WHERE event_id = $2")
+                        .bind(Json(enriched_json))
+                        .bind(&event_id)
+                        .execute(&pool)
+                        .await
+                {
+                    warn!(event_id, %error, "failed to update enriched field");
+                } else {
+                    updated += 1;
+                }
             } else {
                 debug!(event_id, contract_id, event_name, "no enrichment available");
             }
